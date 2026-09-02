@@ -288,28 +288,31 @@ def instalar_busqueda_tipo(listbox: wx.ListBox, obtener_textos) -> None:
     listbox.Bind(wx.EVT_CHAR, _on_char)
 
 
-# ── Paleta «piedra cálida + terracota» ───────────────────────────────────────
-# Base de carbón CÁLIDO (warm stone), no negro puro ni el típico azul/morado.
-# Un acento terracota con personalidad y un teal secundario; saturación
-# contenida para sesiones largas y buen contraste para quien la ve.
+# ── Paleta «crema + salvia» (PALETA-COLORES.md, modo claro tal cual) ────────
+# Fondo crema y salvia como color de marca, igual que en el md de origen.
+# `accent`/`accent2`/`gold`/`green`/`red` son texto (secciones, estados),
+# no fondos: el md no da variantes de texto para esos tonos porque en su app
+# solo se usan como fondo/relleno, así que aquí se oscurecieron lo justo para
+# llegar a 4.5:1 sobre el fondo. Contraste comprobado con la fórmula WCAG en
+# cada par texto/fondo real de la app; todos dan 4.5:1 o más.
 
 class _T:
-    bg      = wx.Colour(28,  25,  23)   # #1C1917  carbón cálido
-    surface = wx.Colour(41,  37,  36)   # #292524  paneles, grupos, pestañas
-    field   = wx.Colour(54,  49,  46)   # #36312E  campos
-    border  = wx.Colour(87,  83,  78)   # #57534E
-    text    = wx.Colour(231, 229, 228)  # #E7E5E4  texto principal
-    dim     = wx.Colour(168, 162, 158)  # #A8A29E  texto secundario
-    accent  = wx.Colour(232, 116, 92)   # #E8745C  terracota (primario)
-    accent2 = wx.Colour(45,  157, 143)  # #2D9D8F  teal (secundario)
-    gold    = wx.Colour(230, 179, 95)   # #E6B35F  Super Chats
-    green   = wx.Colour(138, 176, 120)  # #8AB078  conectado / éxito
-    red     = wx.Colour(224, 122, 108)  # #E07A6C  error
-    btn     = wx.Colour(54,  49,  46)   # botones secundarios
-    btn_t   = wx.Colour(231, 229, 228)
-    # Botón primario (Conectar): fondo acento con texto oscuro para destacar.
-    primary   = wx.Colour(232, 116, 92)
-    primary_t = wx.Colour(28,  25,  23)
+    bg      = wx.Colour(247, 244, 238)  # #F7F4EE  crema (fondo de marca)
+    surface = wx.Colour(255, 255, 255)  # #FFFFFF  paneles, grupos, pestañas
+    field   = wx.Colour(233, 225, 211)  # #E9E1D3  campos (secundario/beige)
+    border  = wx.Colour(227, 220, 207)  # #E3DCCF
+    text    = wx.Colour(51,  51,  51)   # #333333  texto principal
+    dim     = wx.Colour(107, 107, 107)  # #6B6B6B  texto secundario
+    accent  = wx.Colour(63,  91,  58)   # #3F5B3A  salvia oscurecida (primario, texto)
+    accent2 = wx.Colour(138, 90,  82)   # #8A5A52  rosa oscurecida (secundario, texto)
+    gold    = wx.Colour(131, 99,  11)   # #83630B  Super Chats
+    green   = wx.Colour(46,  107, 50)   # #2E6B32  conectado / éxito
+    red     = wx.Colour(179, 38,  30)   # #B3261E  error
+    btn     = wx.Colour(233, 225, 211)  # botones secundarios (= field)
+    btn_t   = wx.Colour(51,  51,  51)
+    # Botón primario (Conectar): salvia tal cual del md, texto oscuro encima.
+    primary   = wx.Colour(202, 215, 197)  # #CAD7C5  salvia (marca, sin oscurecer)
+    primary_t = wx.Colour(51,  51,  51)
 
 
 def _tc(w, bg=None, fg=None):
@@ -406,6 +409,12 @@ class YTChatFrame(wx.Frame):
             size=(ANCHO_DEFECTO, ALTO_DEFECTO),
             name="VentanaPrincipal",
         )
+        # Piso de la ventana: sin esto, se podía achicar hasta el punto de
+        # aplastar el chat, el reproductor y los textos, cortándolos.
+        try:
+            self.SetMinSize((640, 480))
+        except Exception:
+            pass
         self._config    = config
         self._cola      = cola
         self._stats     = stats
@@ -763,7 +772,8 @@ class YTChatFrame(wx.Frame):
 
         self.lbl_tipo = wx.StaticText(panel, label=MENSAJE_INICIAL, name="TipoVideo")
         self.lbl_tipo.SetForegroundColour(_T.dim)
-        vs.Add(self.lbl_tipo, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        self.lbl_tipo.Wrap(ANCHO_DEFECTO - 40)
+        vs.Add(self.lbl_tipo, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
 
         # ── Zona de contenido: notebook + reproductor. Se oculta hasta que hay
         # conexión y se vuelve a ocultar al desconectar (queda solo la barra
@@ -787,9 +797,10 @@ class YTChatFrame(wx.Frame):
             self.nb.AddPage(self._pag_info, "Información")
         else:
             self._pag_info.Hide()
-        # Piso para que la lista del chat no quede aplastada por el reproductor
-        # en ventanas bajas.
-        self.nb.SetMinSize((-1, 170))
+        # Piso para que la lista del chat, los comentarios y la información no
+        # queden aplastados por el reproductor en ventanas bajas: 170 dejaba
+        # ver 2-3 mensajes; con esto se ven varios más sin tocar el reproductor.
+        self.nb.SetMinSize((-1, 260))
         zvs.Add(self.nb, 3, wx.EXPAND | wx.BOTTOM, 10)
 
         # Proporción 3/2 (antes el reproductor iba fijo en 0): chat y reproductor
@@ -900,6 +911,7 @@ class YTChatFrame(wx.Frame):
     def _bind_events(self):
         self.Bind(wx.EVT_CLOSE, self._on_close)
         self.Bind(wx.EVT_ACTIVATE, self._on_activate)
+        self.Bind(wx.EVT_SIZE, self._on_resize)
         self.btn_conectar.Bind(wx.EVT_BUTTON, self._on_conectar)
         self.txt_url.Bind(wx.EVT_TEXT_ENTER,  self._on_conectar)
         self.nb.Bind(wx.EVT_NOTEBOOK_PAGE_CHANGED, self._on_nb_page)
@@ -920,6 +932,26 @@ class YTChatFrame(wx.Frame):
         if 0 <= idx < self.nb.GetPageCount():
             anunciar(self.nb.GetPageText(idx))
         event.Skip()
+
+    def _on_resize(self, event):
+        event.Skip()
+        self._ajustar_ancho_tipo()
+
+    def _ajustar_ancho_tipo(self) -> None:
+        """Reajusta el salto de línea de lbl_tipo al ancho disponible: con
+        Wrap() fijo, ensanchar o angostar la ventana dejaba el texto cortado
+        o con un hueco de sobra en vez de acomodarse."""
+        if not hasattr(self, "lbl_tipo"):
+            return
+        try:
+            ancho = max(200, self.lbl_tipo.GetParent().GetClientSize().Width - 20)
+            self.lbl_tipo.Wrap(ancho)
+        except Exception:
+            pass
+
+    def _fijar_tipo(self, texto: str) -> None:
+        self.lbl_tipo.SetLabel(texto)
+        self._ajustar_ancho_tipo()
 
     def _on_activate(self, event):
         # Al volver el foco a la app, llevarlo al contenido (chat/comentarios);
@@ -1910,7 +1942,7 @@ class YTChatFrame(wx.Frame):
             if estaba:
                 self._mostrar_zona(False)
                 self.set_titulo_stream("")
-                self.lbl_tipo.SetLabel(MENSAJE_INICIAL)
+                self._fijar_tipo(MENSAJE_INICIAL)
                 _snd.reproducir("desconectado")
                 anunciar("Desconectado")
                 # Sacar el foco del panel del reproductor ANTES de que quede
@@ -2015,16 +2047,16 @@ class YTChatFrame(wx.Frame):
         except Exception: pass
 
         if tipo == deteccion.LIVE:
-            self.lbl_tipo.SetLabel("Directo en vivo: leyendo el chat.")
+            self._fijar_tipo("Directo en vivo: leyendo el chat.")
             self.nb.SetSelection(PAG_CHAT)
         elif tipo == deteccion.UPCOMING:
-            self.lbl_tipo.SetLabel("Directo programado: aún sin chat. Hay comentarios.")
+            self._fijar_tipo("Directo programado: aún sin chat. Hay comentarios.")
             self.nb.SetSelection(PAG_COMENTARIOS)
         elif tipo == deteccion.VOD:
-            self.lbl_tipo.SetLabel("Vídeo subido: comentarios y reproductor.")
+            self._fijar_tipo("Vídeo subido: comentarios y reproductor.")
             self.nb.SetSelection(PAG_COMENTARIOS)
         else:
-            self.lbl_tipo.SetLabel("Tipo no determinado: intentando leer el chat.")
+            self._fijar_tipo("Tipo no determinado: intentando leer el chat.")
 
     def configurar_tiktok(self, usuario: str, url_flujo: str) -> None:
         """Prepara la ventana para un directo de TikTok: chat en limpio, pestaña
@@ -2045,7 +2077,7 @@ class YTChatFrame(wx.Frame):
         autoplay = bool(self._config.get("autoplay_reproductor", True))
         try:    self._rep_panel.set_flujo(url_flujo, autoplay=autoplay)
         except Exception as exc: logger.debug("reproductor tiktok: %s", exc)
-        self.lbl_tipo.SetLabel(f"Directo de TikTok de @{usuario}: leyendo el chat.")
+        self._fijar_tipo(f"Directo de TikTok de @{usuario}: leyendo el chat.")
         self.nb.SetSelection(PAG_CHAT)
 
     def set_url(self, url: str) -> None:

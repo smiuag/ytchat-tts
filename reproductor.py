@@ -588,7 +588,7 @@ class ReproductorPanel(wx.Panel):
     def _mostrar_estado_cerrando(self, debe_anunciar: bool) -> None:
         try:
             if hasattr(self, "lbl_estado"):
-                self.lbl_estado.SetLabel("Cerrando la reproducción anterior.")
+                self._fijar_estado("Cerrando la reproducción anterior.")
         except Exception:
             pass
         if debe_anunciar:
@@ -850,6 +850,7 @@ class ReproductorPanel(wx.Panel):
         # genérica: sin nombre accesible reforzado, el lector no dice nada útil
         # al llegar aquí (p. ej. con doble clic para pantalla completa).
         self._video = wx.Window(caja, size=(-1, 160), name="Vídeo")
+        self._video.SetMinSize((-1, 160))  # piso: que no lo aplaste el chat
         self._video.SetBackgroundColour(wx.BLACK)
         nombre_accesible(self._video, "Vídeo. Doble clic para pantalla completa.")
         box.Add(self._video, 1, wx.EXPAND | wx.ALL, 6)
@@ -942,6 +943,7 @@ class ReproductorPanel(wx.Panel):
         self.sld_vol.Bind(wx.EVT_KEY_DOWN, self._on_vol_key)
         self._video.Bind(wx.EVT_LEFT_DCLICK, lambda e: self.alternar_pantalla_completa())
         self.btn_toggle_botones.Bind(wx.EVT_BUTTON, lambda e: self.alternar_botones())
+        self.Bind(wx.EVT_SIZE, self._on_resize)
 
         self._timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self._on_timer, self._timer)
@@ -950,6 +952,26 @@ class ReproductorPanel(wx.Panel):
 
         # Aplicar el estado guardado (por defecto, botones ocultos = minimalista).
         self._aplicar_visibilidad_botones()
+
+    def _on_resize(self, event):
+        event.Skip()
+        self._ajustar_ancho_estado()
+
+    def _ajustar_ancho_estado(self) -> None:
+        """Reajusta el salto de línea de lbl_estado al ancho disponible: sin
+        esto, un aviso largo (p. ej. el de espera al cargar) se salía de la
+        ventana en vez de bajar de línea."""
+        if not hasattr(self, "lbl_estado"):
+            return
+        try:
+            ancho = max(150, self.GetClientSize().Width - 40)
+            self.lbl_estado.Wrap(ancho)
+        except Exception:
+            pass
+
+    def _fijar_estado(self, texto: str) -> None:
+        self.lbl_estado.SetLabel(texto)
+        self._ajustar_ancho_estado()
 
     def _btn_icono(self, bmp, etiqueta, tooltip):
         # Icono + TEXTO: el texto es el nombre accesible que lee el lector (un
@@ -1049,7 +1071,7 @@ class ReproductorPanel(wx.Panel):
         if self._video_id and autoplay:
             self.cargar(reproducir=True)
         else:
-            self.lbl_estado.SetLabel("Listo. Pulsa Reproducir.")
+            self._fijar_estado("Listo. Pulsa Reproducir.")
 
     def set_flujo(self, url: str, autoplay: bool = True) -> None:
         """Reproduce una URL de flujo directa (el HLS de un directo de TikTok).
@@ -1070,9 +1092,9 @@ class ReproductorPanel(wx.Panel):
         if self._url_flujo and autoplay:
             self._reproducir_flujo()
         elif self._url_flujo:
-            self.lbl_estado.SetLabel("Listo. Pulsa Reproducir.")
+            self._fijar_estado("Listo. Pulsa Reproducir.")
         else:
-            self.lbl_estado.SetLabel("Este directo no trae vídeo reproducible.")
+            self._fijar_estado("Este directo no trae vídeo reproducible.")
 
     def detener_todo(self) -> None:
         self._precalentamiento_cancelado = True
@@ -1146,7 +1168,7 @@ class ReproductorPanel(wx.Panel):
         self._cancelar_transporte()
         self._intencion_reproducir = reproducir
         self._cargando = True
-        self.lbl_estado.SetLabel("Cargando vídeo…")
+        self._fijar_estado("Cargando vídeo…")
         anunciar("Cargando vídeo")
         vid = self._video_id
         gen = self._gen   # si cambia al volver, esta carga ya no vale
@@ -1311,11 +1333,11 @@ class ReproductorPanel(wx.Panel):
         if reproducir:
             if hasattr(self, "_estado_inicio"):
                 self._estado_inicio.iniciar()
-            self.lbl_estado.SetLabel("Cargando vídeo…")
+            self._fijar_estado("Cargando vídeo…")
         else:
             if hasattr(self, "_estado_inicio"):
                 self._estado_inicio.cancelar()
-            self.lbl_estado.SetLabel("Listo.")
+            self._fijar_estado("Listo.")
 
     def _reproducir_flujo(self, reproducir: bool = True):
         """Arranca la URL de flujo directa en VLC (mismo camino final que
@@ -1357,11 +1379,11 @@ class ReproductorPanel(wx.Panel):
         if reproducir:
             if hasattr(self, "_estado_inicio"):
                 self._estado_inicio.iniciar()
-            self.lbl_estado.SetLabel("Cargando vídeo…")
+            self._fijar_estado("Cargando vídeo…")
         else:
             if hasattr(self, "_estado_inicio"):
                 self._estado_inicio.cancelar()
-            self.lbl_estado.SetLabel("Listo.")
+            self._fijar_estado("Listo.")
 
     def set_calidad(self, altura):
         """altura=None → automática; si no hay info aún, se aplica al cargar."""
@@ -1382,7 +1404,7 @@ class ReproductorPanel(wx.Panel):
         self._timer_progreso.Stop()
         import sound_player as _snd
         _snd.reproducir("error")
-        self.lbl_estado.SetLabel("No se pudo cargar el vídeo.")
+        self._fijar_estado("No se pudo cargar el vídeo.")
         anunciar("No se pudo cargar el vídeo")
 
     def _on_timer_progreso(self, _event):
@@ -1393,7 +1415,7 @@ class ReproductorPanel(wx.Panel):
         frase = progreso.aviso_de_espera(segundos, self._ultimo_aviso_progreso)
         if frase:
             self._ultimo_aviso_progreso = segundos
-            self.lbl_estado.SetLabel(frase)
+            self._fijar_estado(frase)
             # Se repite durante la carga y no debe cortar lo que se está oyendo.
             anunciar(frase, urgente=False)
 
@@ -1820,10 +1842,10 @@ class ReproductorPanel(wx.Panel):
                         (time.monotonic() - self._marca_url) * 1000)
                     self._marca_url = None
                 if getattr(self, "_url_flujo", ""):
-                    self.lbl_estado.SetLabel("En directo (sin barra de tiempo).")
+                    self._fijar_estado("En directo (sin barra de tiempo).")
                     anunciar("En directo")
                 else:
-                    self.lbl_estado.SetLabel("Reproduciendo.")
+                    self._fijar_estado("Reproduciendo.")
                     anunciar("Reproduciendo")
         self._evaluar_transporte()
         self._evaluar_busqueda()

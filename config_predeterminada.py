@@ -86,7 +86,7 @@ _ORDEN: list[tuple[str, list[tuple[str, str]]]] = [
         ("autoplay_reproductor", "true"),
         ("filtro_activo", "todos"),
         ("silenciar_sonidos", "false"),
-        ("mostrar_botones_reproductor", "false"),
+        ("mostrar_botones_reproductor", "true"),
         ("cache_video_mb", "1024"),
         ("mostrar_metadatos", "true"),
     ]),

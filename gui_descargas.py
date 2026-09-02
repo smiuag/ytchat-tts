@@ -163,7 +163,6 @@ class GestorDescargasDialog(wx.Dialog):
         self.chk_enumerar = wx.CheckBox(
             padre, name="EnumerarPlaylist",
             label="&Enumerar ítems de playlist (01_, 02_…)")
-        self.chk_enumerar.SetForegroundColour(_T.text)
         self.chk_enumerar.SetValue(bool(self._opciones.get("enumerar", False)))
         box.Add(self.chk_enumerar, 0, wx.ALL, 6)
 
