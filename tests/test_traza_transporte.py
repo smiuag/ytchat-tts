@@ -86,6 +86,9 @@ class TestTopologia(unittest.TestCase):
         self.assertEqual(topologia_medio(), "unica")
         self.assertEqual(topologia_medio(es_local=True, tiene_esclavo=True), "local")
         self.assertEqual(topologia_medio(es_flujo=True, tiene_esclavo=True), "flujo")
+        self.assertEqual(topologia_medio(usa_relevo=True), "relevo")
+        self.assertEqual(topologia_medio(usa_relevo=True, tiene_esclavo=True), "relevo")
+        self.assertEqual(topologia_medio(es_flujo=True, usa_relevo=True), "flujo")
 
     def test_traza_busqueda_orden_contiene_topologia_y_numeros_sin_url(self):
         linea = traza_busqueda_orden("dividida", "playing", 1000, 60000, 60000, 123)

@@ -47,7 +47,19 @@ class PruebasEsclavoReproductor(unittest.TestCase):
         panel._player = mock.Mock()
         panel._mostrar_pausa = mock.Mock()
         panel._error_carga = mock.Mock()
-        with mock.patch.object(reproductor, "anunciar"):
+        relevo = mock.Mock()
+        relevo.iniciar.return_value = None  # sin relevo: prueba el input-slave directo
+        hilo = mock.Mock()
+        hilo.start.side_effect = lambda: hilo.target()
+
+        def crear(target, _nombre):
+            hilo.target = target
+            return hilo
+
+        with mock.patch.object(reproductor, "anunciar"), \
+                mock.patch.object(reproductor.diagnostico, "crear_hilo", side_effect=crear), \
+                mock.patch.object(reproductor.wx, "CallAfter", side_effect=lambda fn, *a: fn(*a)), \
+                mock.patch.object(reproductor.relevo_ffmpeg, "RelevoFfmpeg", return_value=relevo):
             panel._reproducir_calidad(1080, False)
         return medio
 

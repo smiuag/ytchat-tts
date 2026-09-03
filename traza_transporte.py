@@ -34,10 +34,13 @@ def traza_sin_barra(origen, duracion) -> str:
     return f"SALTO_SIN_BARRA origen={origen} dur={duracion}"
 
 
-def topologia_medio(es_local=False, tiene_esclavo=False, es_flujo=False) -> str:
+def topologia_medio(es_local=False, tiene_esclavo=False, es_flujo=False,
+                    usa_relevo=False) -> str:
     """Etiqueta de topología sin datos sensibles."""
     if es_flujo:
         return "flujo"
+    if usa_relevo:
+        return "relevo"
     if es_local:
         return "local"
     if tiene_esclavo:

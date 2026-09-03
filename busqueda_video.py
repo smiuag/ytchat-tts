@@ -40,13 +40,20 @@ def evaluar_transporte(orden, estado, ahora) -> str:
     return "pendiente"
 
 
-def busqueda_permitida(es_directo, es_local, tiene_esclavo) -> bool:
+def busqueda_permitida(es_directo, es_local, tiene_esclavo, usa_relevo=False) -> bool:
     """Indica si la topología actual admite búsquedas.
 
     Un VOD remoto dividido no admite búsquedas. Un archivo local sí.
     Una fuente única conserva el comportamiento actual. El directo
     no se deshabilita: solo pierde la confirmación especial de final.
+    Un directo por el relevo de ffmpeg (vídeo+audio ya remuxados en un
+    único flujo, ver relevo_ffmpeg.py) tampoco admite búsquedas: para VLC
+    es un flujo en vivo sin ventana de retroceso (comprobado: is_seekable=0,
+    length=0), así que set_time() no hace nada y sin este aviso la app
+    dice «Moviendo a...» y recién a los 8 s «No se pudo mover el vídeo».
     """
+    if usa_relevo:
+        return False
     if es_directo:
         return True
     if es_local:

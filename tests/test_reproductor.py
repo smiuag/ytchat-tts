@@ -124,7 +124,48 @@ class TestSeleccionFormatos(unittest.TestCase):
             reproductor._mejor_audio({"formats": formatos}), "original")
 
 
+class TestPreferirHls(unittest.TestCase):
+
+    def test_hay_hls_se_queda_solo_con_esas(self):
+        formatos = [
+            {"protocol": "https", "url": "dash-crudo"},
+            {"protocol": "m3u8_native", "url": "hls"},
+        ]
+        self.assertEqual(reproductor._preferir_hls(formatos),
+                         [{"protocol": "m3u8_native", "url": "hls"}])
+
+    def test_sin_hls_deja_la_lista_igual(self):
+        formatos = [{"protocol": "https", "url": "dash-crudo"}]
+        self.assertEqual(reproductor._preferir_hls(formatos), formatos)
+
+    def test_lista_vacia(self):
+        self.assertEqual(reproductor._preferir_hls([]), [])
+
+    def test_protocolo_ausente_no_rompe(self):
+        formatos = [{"url": "sin-protocolo"}]
+        self.assertEqual(reproductor._preferir_hls(formatos), formatos)
+
+
 class TestFuentesParaDirecto(unittest.TestCase):
+
+    def test_directo_mezcla_hls_y_dash_crudo_gana_hls(self):
+        # Lo que se vio con un directo real: la misma extracción trae
+        # variantes m3u8 (HLS, la que entienden VLC/ffmpeg) y variantes
+        # «https»/DASH-en-crudo (protocolo de secuencias propio de YouTube,
+        # que ffmpeg no sabe abrir directo: "Invalid data found").
+        info = {"formats": [
+            {"vcodec": "avc1", "acodec": "none", "height": 1080,
+             "protocol": "https", "url": "video-dash-crudo"},
+            {"vcodec": "none", "acodec": "mp4a", "protocol": "https",
+             "url": "audio-dash-crudo"},
+            {"vcodec": "avc1", "acodec": "none", "height": 1080,
+             "protocol": "m3u8_native", "url": "video-hls"},
+            {"vcodec": "none", "acodec": "mp4a", "protocol": "m3u8_native",
+             "url": "audio-hls"},
+        ]}
+        self.assertEqual(
+            reproductor.fuentes_para_directo(info),
+            ("video-hls", "audio-hls"))
 
     def test_url_superior_gana_sobre_las_demás_fuentes(self):
         info = {
@@ -176,24 +217,106 @@ class TestReproducirDirecto(unittest.TestCase):
         panel._muted = False
         panel._timer = mock.Mock()
         panel.lbl_estado = mock.Mock()
+        panel._video_id = "vid"
+        panel._gen = 0
+        panel._relevo_gen = 0
+        panel._relevo_ffmpeg = None
         panel._asegurar_player = mock.Mock(return_value=True)
         panel._error_carga = mock.Mock()
         panel._mostrar_pausa = mock.Mock()
         return panel
 
-    def test_directo_usa_el_par_de_formatos_solicitados(self):
+    def _hilo_sincrono(self):
+        """Reemplaza diagnostico.crear_hilo por algo que corre en el
+        momento, y wx.CallAfter por una llamada directa: así el relevo (que
+        en producción va a un hilo aparte para no bloquear la GUI) se puede
+        probar sin hilos reales."""
+        hilo = mock.Mock()
+
+        def crear(target, _nombre):
+            hilo.target = target
+            return hilo
+
+        hilo.start.side_effect = lambda: hilo.target()
+        return (
+            mock.patch.object(reproductor.diagnostico, "crear_hilo", side_effect=crear),
+            mock.patch.object(reproductor.wx, "CallAfter", side_effect=lambda fn, *a: fn(*a)),
+        )
+
+    def test_directo_con_pares_separados_usa_el_relevo_de_ffmpeg(self):
         panel = self._panel({"is_live": True, "formats": [], "requested_formats": [
             {"vcodec": "avc1", "acodec": "none", "url": "video-solicitado"},
             {"vcodec": "none", "acodec": "mp4a", "url": "audio-solicitado"},
         ]})
         medio = mock.Mock()
         panel._inst.media_new.return_value = medio
+        relevo = mock.Mock()
+        relevo.iniciar.return_value = "tcp://127.0.0.1:5555"
 
-        panel._reproducir_calidad(None, reproducir=False)
+        parche_hilo, parche_callafter = self._hilo_sincrono()
+        with parche_hilo, parche_callafter, \
+                mock.patch.object(reproductor.relevo_ffmpeg, "RelevoFfmpeg",
+                                  return_value=relevo) as clase_relevo, \
+                mock.patch.object(reproductor.time, "sleep"):
+            panel._reproducir_calidad(None, reproducir=False)
+
+        clase_relevo.assert_called_once_with("video-solicitado", "audio-solicitado")
+        panel._inst.media_new.assert_called_once_with("tcp://127.0.0.1:5555")
+        opciones = [c.args[0] for c in medio.add_option.call_args_list]
+        self.assertFalse(any(o.startswith(":input-slave=") for o in opciones))
+        self.assertIs(panel._relevo_ffmpeg, relevo)
+        self.assertFalse(panel._tiene_esclavo)
+        panel._error_carga.assert_not_called()
+
+    def test_directo_si_el_relevo_no_arranca_cae_a_input_slave(self):
+        panel = self._panel({"is_live": True, "formats": [], "requested_formats": [
+            {"vcodec": "avc1", "acodec": "none", "url": "video-solicitado"},
+            {"vcodec": "none", "acodec": "mp4a", "url": "audio-solicitado"},
+        ]})
+        medio = mock.Mock()
+        panel._inst.media_new.return_value = medio
+        relevo = mock.Mock()
+        relevo.iniciar.return_value = None  # sin ffmpeg disponible, por ejemplo
+
+        parche_hilo, parche_callafter = self._hilo_sincrono()
+        with parche_hilo, parche_callafter, \
+                mock.patch.object(reproductor.relevo_ffmpeg, "RelevoFfmpeg",
+                                  return_value=relevo):
+            panel._reproducir_calidad(None, reproducir=False)
 
         panel._inst.media_new.assert_called_once_with("video-solicitado")
         medio.add_option.assert_any_call(":input-slave=audio-solicitado")
+        self.assertIsNone(panel._relevo_ffmpeg)
         panel._error_carga.assert_not_called()
+
+    def test_directo_descarta_el_relevo_si_ya_no_es_el_ultimo_pedido(self):
+        # El usuario cambió de vídeo (o desconectó) mientras el relevo
+        # arrancaba: el resultado, si llega tarde, no debe usarse ni dejar
+        # el proceso de ffmpeg huérfano.
+        panel = self._panel({"is_live": True, "formats": [], "requested_formats": [
+            {"vcodec": "avc1", "acodec": "none", "url": "video-solicitado"},
+            {"vcodec": "none", "acodec": "mp4a", "url": "audio-solicitado"},
+        ]})
+        relevo = mock.Mock()
+        relevo.iniciar.return_value = "tcp://127.0.0.1:5555"
+
+        callbacks = []
+        with mock.patch.object(reproductor.diagnostico, "crear_hilo",
+                               side_effect=lambda target, _n: mock.Mock(
+                                   start=lambda: target())), \
+                mock.patch.object(reproductor.wx, "CallAfter",
+                                  side_effect=lambda fn, *a: callbacks.append(
+                                      lambda: fn(*a))), \
+                mock.patch.object(reproductor.relevo_ffmpeg, "RelevoFfmpeg",
+                                  return_value=relevo), \
+                mock.patch.object(reproductor.time, "sleep"):
+            panel._reproducir_calidad(None, reproducir=False)
+            panel._video_id = "otro-vid"  # cambió de vídeo antes de que llegue
+            callbacks[0]()
+
+        relevo.detener.assert_called_once()
+        self.assertIsNone(panel._relevo_ffmpeg)
+        panel._inst.media_new.assert_not_called()
 
     def test_directo_sin_fuentes_deja_diagnostico(self):
         panel = self._panel({"is_live": True, "formats": [],

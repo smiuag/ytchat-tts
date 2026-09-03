@@ -1476,6 +1476,14 @@ class TestBusquedaPermitida(unittest.TestCase):
         from busqueda_video import busqueda_permitida
         self.assertTrue(busqueda_permitida(True, False, False))
 
+    def test_directo_por_relevo_no_permitida(self):
+        # El relevo de ffmpeg deja el directo como un único flujo sin
+        # ventana de retroceso para VLC (is_seekable=0, comprobado con un
+        # directo real): buscar no hace nada, así que mejor avisar antes.
+        from busqueda_video import busqueda_permitida
+        self.assertFalse(busqueda_permitida(True, False, False, usa_relevo=True))
+        self.assertFalse(busqueda_permitida(True, True, True, usa_relevo=True))
+
 
 class TestEstadoBusquedaDirectoBorde(unittest.TestCase):
 

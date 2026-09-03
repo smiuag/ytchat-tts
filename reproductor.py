@@ -40,6 +40,7 @@ from traza_transporte import (
 import ytdlp_bin
 import esclavo_audio
 import reproductor_ciclo
+import relevo_ffmpeg
 from gui import anunciar, nombre_accesible, _T, _tc
 
 logger = diagnostico.obtener_logger(__name__)
@@ -289,15 +290,26 @@ def _video_para_altura(info: dict, altura: int) -> tuple[str, bool]:
     return "", False
 
 
+def _preferir_hls(formatos: list) -> list:
+    """Para directos, yt-dlp suele traer en la misma lista variantes HLS
+    (.m3u8) y variantes «DASH en crudo» (protocol=https/http_dash_segments):
+    una URL que exige el manejo de secuencias propio de yt-dlp y que ni VLC
+    ni ffmpeg saben leer bien solos («Invalid data found», comprobado). Si
+    hay HLS, se usa esa familia; si no hay ninguna, se deja la lista igual."""
+    hls = [f for f in formatos if "m3u8" in (f.get("protocol") or "")]
+    return hls or list(formatos)
+
+
 def fuentes_para_directo(info: dict) -> tuple[str, str]:
     """(url de vídeo, url de audio esclavo). Audio vacío si no hace falta."""
     url = info.get("url") or ""
     if url:
         return url, ""
 
-    url, progresivo = _video_para_altura(info, 10_000)
+    info_hls = {**info, "formats": _preferir_hls(info.get("formats") or [])}
+    url, progresivo = _video_para_altura(info_hls, 10_000)
     if url:
-        return url, "" if progresivo else _mejor_audio(info)
+        return url, "" if progresivo else _mejor_audio(info_hls)
 
     video = audio = ""
     for formato in info.get("requested_formats", []) or []:
@@ -513,6 +525,11 @@ class ReproductorPanel(wx.Panel):
         self._fs = None        # ventana de pantalla completa, si está activa
         self._precalentamiento_cancelado = False
         self._ciclo = reproductor_ciclo.CicloReproductor()
+        # Relevo de ffmpeg para directos con vídeo y audio separados (ver
+        # relevo_ffmpeg.py): evita el input-slave de VLC, que pierde la
+        # sincronía entre dos HLS independientemente en vivo cada 60-90 s.
+        self._relevo_ffmpeg = None
+        self._relevo_gen = 0
 
         self.SetBackgroundColour(_T.bg)
         self.SetForegroundColour(_T.text)
@@ -785,6 +802,7 @@ class ReproductorPanel(wx.Panel):
             es_local=bool(getattr(self, "_usando_cache_local", False)),
             tiene_esclavo=bool(getattr(self, "_tiene_esclavo", False)),
             es_flujo=bool(getattr(self, "_url_flujo", "")),
+            usa_relevo=bool(getattr(self, "_relevo_ffmpeg", None)),
         )
 
     def _estado_vlc_actual(self) -> str:
@@ -808,6 +826,7 @@ class ReproductorPanel(wx.Panel):
             self._es_directo_actual(),
             bool(getattr(self, "_usando_cache_local", False)),
             bool(getattr(self, "_tiene_esclavo", False)),
+            usa_relevo=bool(getattr(self, "_relevo_ffmpeg", None)),
         )
 
     def _cancelar_busqueda(self, motivo: str = "cancelado") -> None:
@@ -1280,12 +1299,19 @@ class ReproductorPanel(wx.Panel):
         except Exception as exc:
             logger.debug("cambio a caché de vídeo: %s", exc)
 
+    def _detener_relevo_ffmpeg(self) -> None:
+        relevo = getattr(self, "_relevo_ffmpeg", None)
+        self._relevo_ffmpeg = None
+        if relevo is not None:
+            relevo.detener()
+
     def _reproducir_calidad(self, altura, reproducir):
         if self._info is None or not self._asegurar_player():
             return
         self._cancelar_busqueda()
         self._tiene_esclavo = False
         self._usando_cache_local = False
+        self._detener_relevo_ffmpeg()
         es_directo = self._info.get("is_live")
         if altura is None or es_directo:
             # Auto / directo: el formato combinado que elija yt-dlp.
@@ -1303,8 +1329,52 @@ class ReproductorPanel(wx.Panel):
         if not url:
             self._error_carga()
             return
-        # guardar topologia antes de reproducir
+
+        if es_directo and slave:
+            # Vídeo y audio en vivo por separado: en vez de darle las dos
+            # fuentes a VLC como input-slave (pierde la sincronía entre
+            # ambas cada 60-90 s, comprobado con un directo real), un
+            # relevo de ffmpeg las remuxa antes en un único flujo. Arrancar
+            # el proceso y esperar a que su listener esté arriba no debe
+            # congelar la GUI, así que va en un hilo aparte.
+            self._relevo_gen = getattr(self, "_relevo_gen", 0) + 1
+            relevo_gen = self._relevo_gen
+            gen = self._gen
+            video_id_actual = self._video_id
+            self._fijar_estado("Cargando vídeo…")
+
+            def _preparar_relevo(video_url=url, audio_url=slave):
+                relevo = relevo_ffmpeg.RelevoFfmpeg(video_url, audio_url)
+                direccion = relevo.iniciar()
+                if direccion:
+                    time.sleep(relevo_ffmpeg.TIEMPO_ESPERA_LISTENER)
+                wx.CallAfter(self._relevo_listo, relevo, direccion, relevo_gen,
+                            gen, video_id_actual, video_url, audio_url, reproducir)
+
+            diagnostico.crear_hilo(_preparar_relevo, "ReproductorRelevo").start()
+            return
+
         self._tiene_esclavo = bool(slave)
+        self._continuar_reproducir_calidad(url, slave, es_directo, reproducir)
+
+    def _relevo_listo(self, relevo, direccion, relevo_gen, gen, video_id_actual,
+                      url, slave, reproducir) -> None:
+        if relevo_gen != self._relevo_gen or gen != self._gen \
+                or video_id_actual != self._video_id:
+            relevo.detener()
+            return
+        if direccion is None:
+            # No se pudo levantar el relevo (sin ffmpeg, puerto, etc.): se
+            # sigue con input-slave directo, como antes de tener el relevo.
+            self._relevo_ffmpeg = None
+            self._tiene_esclavo = bool(slave)
+            self._continuar_reproducir_calidad(url, slave, True, reproducir)
+            return
+        self._relevo_ffmpeg = relevo
+        self._tiene_esclavo = False
+        self._continuar_reproducir_calidad(direccion, "", True, reproducir)
+
+    def _continuar_reproducir_calidad(self, url, slave, es_directo, reproducir):
         try:
             media = self._inst.media_new(url)
             for opt in opciones_medio(es_directo):
@@ -1525,6 +1595,7 @@ class ReproductorPanel(wx.Panel):
         if tarea is not None:
             tarea.cancelacion.set()
             self._tarea_cache_video = None
+        self._detener_relevo_ffmpeg()
         self._intencion_reproducir = False
         self._timer_progreso.Stop()
         if self._player is not None:
