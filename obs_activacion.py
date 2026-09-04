@@ -3,6 +3,8 @@
 import json
 import subprocess
 
+import archivos
+
 
 NO_TOCAR = "no_tocar"
 ACTIVAR = "activar"
@@ -45,10 +47,10 @@ def activar_servidor(ruta):
     try:
         with open(ruta, "r", encoding="utf-8") as archivo:
             ajustes = json.load(archivo)
-        with open(ruta, "w", encoding="utf-8") as archivo:
-            json.dump(ajustes_con_servidor_activado(ajustes), archivo,
-                      ensure_ascii=False, indent=2)
-            archivo.write("\n")
+        # Es el config.json del propio OBS: abrirlo en "w" lo truncaba antes
+        # de volcar y un fallo a mitad dejaba a OBS sin su contraseña.
+        archivos.escribir_json_atomico(
+            ruta, ajustes_con_servidor_activado(ajustes), indent=2)
     except (OSError, ValueError, TypeError) as exc:
         return f"No se pudo activar el servidor websocket de OBS: {exc}"
     return "El servidor websocket de OBS se activó. Inicia OBS para usarlo"

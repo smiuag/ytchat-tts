@@ -87,29 +87,36 @@ class Conexiones:
                 if not self._registro.vigente(gen):
                     return
                 cliente = youtube_api.ClienteYouTube(credenciales.cargar())
-                while not ps.wait(60):
+                # La primera consulta va nada más conectar (antes se esperaba
+                # un minuto entero sin espectadores ni hora de inicio); las
+                # siguientes, cada minuto.
+                while not ps.is_set():
                     if not self._registro.vigente(gen):
                         return
+                    detalles = None
                     try:
                         detalles = cliente.detalles_directo(vid)
                     except Exception as exc:
                         logger.debug("actualizar detalles del directo: %s", exc)
-                        continue
                     if not self._registro.vigente(gen):
                         return
                     frame_actual = _gm._gui_frame
-                    if frame_actual and frame_actual._alive:
+                    if detalles is not None and frame_actual and frame_actual._alive:
                         import wx
                         wx.CallAfter(frame_actual.set_espectadores,
                                      detalles["espectadores"])
                         wx.CallAfter(frame_actual.set_inicio_directo,
                                      detalles["comienzo"])
+                    ps.wait(60)
             except Exception as exc:
                 logger.debug("actualizar detalles del directo: %s", exc)
 
         def _run():
             # Una sola descarga del watch para sacar título, tipo y metadatos.
-            titulo, tipo, metadatos = main.obtener_info_video(vid)
+            # sesion_activa: si se desconecta a mitad, no encadena más pasos
+            # y el hilo Chat termina rápido (el cierre de la app lo espera).
+            titulo, tipo, metadatos = main.obtener_info_video(
+                vid, sesion_activa=lambda: self._registro.vigente(gen))
             # Si mientras buscábamos info se desconectó o se conectó a otro vídeo,
             # esta sesión ya no vale: no tocar la GUI (si no, pisaríamos la nueva).
             if not self._registro.vigente(gen):

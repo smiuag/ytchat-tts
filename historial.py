@@ -15,11 +15,11 @@ Notas de diseño:
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime
 from pathlib import Path
 
+import archivos
 import diagnostico
 
 logger = diagnostico.obtener_logger(__name__)
@@ -66,20 +66,18 @@ def etiqueta(entrada: dict) -> str:
 
 
 def cargar(ruta: Path) -> list:
-    """Lee el historial del JSON. Lista vacía si no existe o está corrupto."""
-    try:
-        if ruta.exists():
-            data = json.loads(ruta.read_text(encoding="utf-8"))
-            return data if isinstance(data, list) else []
-    except Exception as exc:
-        logger.debug("cargar historial: %s", exc)
-    return []
+    """Lee el historial del JSON. Lista vacía si no existe o está corrupto.
+    Se descartan las entradas que no sean dict: una lista editada a mano con
+    basura dentro no debe tirar el diálogo del historial."""
+    data = archivos.leer_json(ruta, [])
+    if not isinstance(data, list):
+        return []
+    return [e for e in data if isinstance(e, dict)]
 
 
 def guardar(ruta: Path, lista: list) -> None:
     """Escribe el historial al JSON (silencioso si falla; no es crítico)."""
     try:
-        ruta.write_text(json.dumps(lista, ensure_ascii=False, indent=1),
-                        encoding="utf-8")
+        archivos.escribir_json_atomico(ruta, lista, indent=1)
     except Exception as exc:
         logger.debug("guardar historial: %s", exc)

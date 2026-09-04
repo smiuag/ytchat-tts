@@ -84,6 +84,29 @@ class TestActivacionObs(unittest.TestCase):
                       "server_password", "server_port"):
             self.assertEqual(resultado[clave], ajustes[clave])
 
+    def test_activar_servidor_no_deja_temporales(self):
+        with tempfile.TemporaryDirectory() as directorio:
+            ruta = Path(directorio) / "config.json"
+            ruta.write_text(json.dumps(self._ajustes_de_prueba()), encoding="utf-8")
+
+            obs_activacion.activar_servidor(ruta)
+
+            self.assertEqual(list(Path(directorio).glob("*.tmp")), [])
+
+    def test_un_fallo_al_escribir_conserva_el_archivo_de_obs(self):
+        # Es el config.json del propio OBS: si se trunca, OBS pierde su contraseña.
+        ajustes = self._ajustes_de_prueba()
+        with tempfile.TemporaryDirectory() as directorio:
+            ruta = Path(directorio) / "config.json"
+            ruta.write_text(json.dumps(ajustes), encoding="utf-8")
+            with mock.patch.object(obs_activacion.archivos, "escribir_json_atomico",
+                                   side_effect=OSError("disco lleno")):
+                frase = obs_activacion.activar_servidor(ruta)
+            resultado = json.loads(ruta.read_text(encoding="utf-8"))
+
+        self.assertIn("No se pudo activar el servidor websocket de OBS", frase)
+        self.assertEqual(resultado, ajustes)
+
     def test_activar_servidor_informa_el_error_si_no_existe_el_archivo(self):
         with tempfile.TemporaryDirectory() as directorio:
             ruta = Path(directorio) / "inexistente.json"

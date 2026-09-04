@@ -10,16 +10,22 @@ usuario y nunca debe subirse al repositorio.
 
 from __future__ import annotations
 
-import json
 import logging
+import threading
 from pathlib import Path
 
+import archivos
 import config
 import diagnostico
 
 logger = diagnostico.obtener_logger(__name__)
 
 NOMBRE_ARCHIVO = "credenciales.json"
+
+# guardar_campo es leer-modificar-escribir y lo llaman hilos de trabajo (el
+# refresco del token OAuth, la GUI): sin candado, dos guardados cruzados
+# pisarían el campo del otro. RLock porque guardar_campo llama a guardar.
+_lock = threading.RLock()
 
 # Estructura por defecto. `token` guarda el JSON de las credenciales OAuth
 # (lo serializa google-auth con Credentials.to_json()); None = sin sesión.
@@ -38,17 +44,12 @@ def ruta() -> Path:
 def cargar() -> dict:
     """Devuelve siempre un dict completo, aunque el archivo falte o esté roto."""
     datos = dict(_DEFECTO)
-    p = ruta()
-    if not p.exists():
-        return datos
-    try:
-        bruto = json.loads(p.read_text(encoding="utf-8"))
-        if isinstance(bruto, dict):
-            for k in _DEFECTO:
-                if k in bruto:
-                    datos[k] = bruto[k]
-    except Exception as exc:
-        logger.warning("No se pudo leer %s: %s", NOMBRE_ARCHIVO, exc)
+    with _lock:
+        bruto = archivos.leer_json(ruta(), None)
+    if isinstance(bruto, dict):
+        for k in _DEFECTO:
+            if k in bruto:
+                datos[k] = bruto[k]
     return datos
 
 
@@ -56,8 +57,8 @@ def guardar(datos: dict) -> bool:
     """Escribe el dict completo. Devuelve True si se guardó."""
     limpio = {k: datos.get(k, _DEFECTO[k]) for k in _DEFECTO}
     try:
-        ruta().write_text(
-            json.dumps(limpio, indent=2, ensure_ascii=False), encoding="utf-8")
+        with _lock:
+            archivos.escribir_json_atomico(ruta(), limpio, indent=2)
         return True
     except Exception as exc:
         logger.error("No se pudo guardar %s: %s", NOMBRE_ARCHIVO, exc)
@@ -69,9 +70,10 @@ def guardar_campo(clave: str, valor) -> bool:
     if clave not in _DEFECTO:
         logger.warning("credenciales: clave desconocida %r", clave)
         return False
-    datos = cargar()
-    datos[clave] = valor
-    return guardar(datos)
+    with _lock:
+        datos = cargar()
+        datos[clave] = valor
+        return guardar(datos)
 
 
 def hay_lectura(datos: dict | None = None) -> bool:

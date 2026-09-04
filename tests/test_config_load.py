@@ -58,6 +58,36 @@ class TestCargarConfiguracion(unittest.TestCase):
         self.addCleanup(manejador.close)
         self.assertEqual(manejador.level, logging.WARNING)
 
+    def test_configurar_logging_es_idempotente(self):
+        with mock.patch.object(config, "app_dir", return_value=Path(self._tmp.name)), \
+             mock.patch.object(config, "RotatingFileHandler"):
+            config.configurar_logging()
+            cuantos = len(self._root.handlers)
+            config.configurar_logging()
+        # Una segunda llamada duplicaba cada línea en consola y en ytchat.log.
+        self.assertEqual(len(self._root.handlers), cuantos)
+
+    def test_guardar_opcion_inserta_tras_la_ultima_clave_de_la_seccion(self):
+        ruta = Path(self._tmp.name) / "config.ini"
+        ruta.write_text("[a]\nx = 1\n\n# comentario final\n\n[b]\ny = 2\n",
+                        encoding="utf-8")
+        config.guardar_opcion(ruta, "a", "z", "3")
+        # Antes la clave migrada caía tras la línea en blanco, pegada a [b].
+        self.assertEqual(ruta.read_text(encoding="utf-8"),
+                         "[a]\nx = 1\nz = 3\n\n# comentario final\n\n[b]\ny = 2\n")
+
+    def test_guardar_opcion_en_seccion_vacia_va_tras_la_cabecera(self):
+        ruta = Path(self._tmp.name) / "config.ini"
+        ruta.write_text("[a]\n\n[b]\ny = 2\n", encoding="utf-8")
+        config.guardar_opcion(ruta, "a", "z", "3")
+        self.assertEqual(ruta.read_text(encoding="utf-8"), "[a]\nz = 3\n\n[b]\ny = 2\n")
+
+    def test_guardar_opcion_al_final_sin_salto_de_linea(self):
+        ruta = Path(self._tmp.name) / "config.ini"
+        ruta.write_text("[a]\nx = 1", encoding="utf-8")
+        config.guardar_opcion(ruta, "a", "z", "3")
+        self.assertEqual(ruta.read_text(encoding="utf-8"), "[a]\nx = 1\nz = 3\n")
+
     def test_regenera_si_falta(self):
         tmp = Path(self._tmp.name)
         with mock.patch.object(config, "app_dir", return_value=tmp):
@@ -177,7 +207,9 @@ class TestCargarConfiguracion(unittest.TestCase):
         self.assertIn("descargas", cfg)
         self.assertEqual(cfg["descargas_formato"], "mp4")
         self.assertEqual(cfg["descargas_bitrate"], 192)
-        self.assertEqual(cfg["descargas_carpeta"], "Descargas")
+        # En el INI queda «Descargas»; el dict ya trae la ruta resuelta
+        # contra app_dir(), que es la que usa el gestor de descargas.
+        self.assertEqual(cfg["descargas_carpeta"], str(Path(self._tmp.name) / "Descargas"))
         self.assertFalse(cfg["descargas_enumerar"])
 
     def test_obtener_opciones_descarga_devuelve_defaults_si_no_existe(self):
@@ -199,6 +231,23 @@ class TestCargarConfiguracion(unittest.TestCase):
         self.assertEqual(op["carpeta"], str(Path(self._tmp.name) / "Descargas"))
         self.assertEqual(ruta.read_text(encoding="utf-8"), contenido)
 
+    def test_obtener_opciones_resuelve_carpeta_relativa_contra_app_dir(self):
+        import config
+        ruta = Path(self._tmp.name) / "config.ini"
+        ruta.write_text("[descargas]\ncarpeta = Descargas\n", encoding="utf-8")
+        with mock.patch.object(config, "app_dir", return_value=Path(self._tmp.name)):
+            op = config.obtener_opciones_descarga()
+        self.assertEqual(op["carpeta"], str(Path(self._tmp.name) / "Descargas"))
+
+    def test_obtener_opciones_respeta_carpeta_absoluta(self):
+        import config
+        ruta = Path(self._tmp.name) / "config.ini"
+        absoluta = Path(self._tmp.name) / "otra"
+        ruta.write_text(f"[descargas]\ncarpeta = {absoluta}\n", encoding="utf-8")
+        with mock.patch.object(config, "app_dir", return_value=Path(self._tmp.name)):
+            op = config.obtener_opciones_descarga()
+        self.assertEqual(op["carpeta"], str(absoluta))
+
     def test_cargar_configuracion_persiste_carpeta_predeterminada(self):
         for contenido in (
             "[voz]\nvoz = 0\n",
@@ -209,7 +258,10 @@ class TestCargarConfiguracion(unittest.TestCase):
                 ruta.write_text(contenido, encoding="utf-8")
                 with mock.patch.object(config, "app_dir", return_value=Path(self._tmp.name)):
                     cfg = config.cargar_configuracion()
-                self.assertEqual(cfg["descargas_carpeta"], "Descargas")
+                # En el INI queda «Descargas»; el dict ya trae la ruta resuelta
+                # contra app_dir(), que es la que usa el gestor de descargas.
+                self.assertEqual(cfg["descargas_carpeta"],
+                                 str(Path(self._tmp.name) / "Descargas"))
                 self.assertRegex(
                     ruta.read_text(encoding="utf-8").lower(),
                     r"(?m)^\s*carpeta\s*=\s*descargas\s*$",

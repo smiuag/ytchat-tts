@@ -1,3 +1,6 @@
+import asyncio
+import queue
+import threading
 import unittest
 import sys
 import types
@@ -123,6 +126,97 @@ class PruebasCableadoMain(unittest.TestCase):
 
         self.assertEqual(registro.call_count, 1)
         cerrar.assert_called_once_with()
+
+
+class PruebasInstanciaUnica(unittest.TestCase):
+    def test_already_exists_es_otra_instancia(self):
+        self.assertTrue(main._hay_otra_instancia(183))
+
+    def test_access_denied_tambien_cuenta_como_otra_instancia(self):
+        # El mutex existe pero lo creó una instancia elevada o de otro usuario.
+        self.assertTrue(main._hay_otra_instancia(5))
+
+    def test_sin_error_no_hay_otra_instancia(self):
+        self.assertFalse(main._hay_otra_instancia(0))
+
+
+class PruebasReconexion(unittest.TestCase):
+    def _config(self, max_intentos=3):
+        return {"reconectar": True, "max_intentos": max_intentos,
+                "espera_entre_intentos": 0}
+
+    def _correr(self, captura, config):
+        estados = []
+        with patch.object(main, "_captura", side_effect=captura), \
+                patch.object(main._snd, "reproducir"):
+            main.captura_con_reconexion(
+                "v", queue.Queue(), config, threading.Event(), main.Stats(),
+                on_estado=lambda tipo, texto: estados.append((tipo, texto)))
+        return estados
+
+    def test_los_intentos_se_reinician_tras_cada_reconexion(self):
+        caidas = [0]
+
+        def captura(video_id, cola, cfg, parada, stats, on_message, on_estado,
+                    sesion_activa):
+            # Cada intento conecta y luego sufre un microcorte.
+            caidas[0] += 1
+            on_estado("conectado", "ok")
+            if caidas[0] >= 6:
+                parada.set()
+            return RuntimeError("microcorte")
+
+        estados = self._correr(captura, self._config(max_intentos=3))
+        self.assertEqual(caidas[0], 6)
+        self.assertFalse(any("agotaron" in texto for _, texto in estados))
+        # Y el aviso de reintento vuelve a contar desde 1 cada vez.
+        reintentos = [texto for tipo, texto in estados if tipo == "reintentando"]
+        self.assertTrue(all("(intento 1 de 3)" in texto for texto in reintentos))
+
+    def test_los_fallos_seguidos_si_agotan_los_intentos(self):
+        def captura(video_id, cola, cfg, parada, stats, on_message, on_estado,
+                    sesion_activa):
+            return RuntimeError("no conecta")
+
+        estados = self._correr(captura, self._config(max_intentos=3))
+        self.assertTrue(any("agotaron los 3" in texto for _, texto in estados))
+
+    def test_captura_cierra_el_loop_de_asyncio_de_cada_intento(self):
+        loops = []
+
+        def en_loop(*args, **kwargs):
+            loops.append(asyncio.get_event_loop())
+            return None
+
+        with patch.object(main, "_captura_en_loop", side_effect=en_loop):
+            main._captura("v", queue.Queue(), {}, threading.Event(), main.Stats())
+            main._captura("v", queue.Queue(), {}, threading.Event(), main.Stats())
+        self.assertEqual(len(loops), 2)
+        self.assertIsNot(loops[0], loops[1])
+        self.assertTrue(all(loop.is_closed() for loop in loops))
+
+
+class PruebasInfoVideoCancelable(unittest.TestCase):
+    def test_no_encadena_mas_pasos_si_la_sesion_ya_no_vale(self):
+        modulo = types.SimpleNamespace(YoutubeDL=Mock(side_effect=RuntimeError("fallo")))
+        with patch.dict(sys.modules, {"yt_dlp": modulo}), \
+                patch.object(main.ytdlp_bin, "info_video") as ejecutable, \
+                patch.object(main, "_descargar_watch") as respaldo:
+            titulo, tipo, metadatos = main.obtener_info_video(
+                "A" * 11, sesion_activa=lambda: False)
+        ejecutable.assert_not_called()
+        respaldo.assert_not_called()
+        self.assertEqual((titulo, tipo, metadatos), ("", main.deteccion.DESCONOCIDO, {}))
+
+    def test_sesion_vigente_sigue_la_cadena_completa(self):
+        modulo = types.SimpleNamespace(YoutubeDL=Mock(side_effect=RuntimeError("fallo")))
+        with patch.dict(sys.modules, {"yt_dlp": modulo}), \
+                patch.object(main.ytdlp_bin, "info_video", return_value=None) as ejecutable, \
+                patch.object(main, "_descargar_watch", return_value="") as respaldo, \
+                patch.object(main, "_clasificar_por_api", return_value=main.deteccion.DESCONOCIDO):
+            main.obtener_info_video("A" * 11, sesion_activa=lambda: True)
+        ejecutable.assert_called_once()
+        respaldo.assert_called_once()
 
 
 if __name__ == "__main__":

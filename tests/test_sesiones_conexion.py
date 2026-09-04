@@ -59,6 +59,15 @@ class PruebasSesiones(unittest.TestCase):
         self.assertTrue(sesion.parada.is_set())
         self.assertFalse(registro.cerrar())
 
+    def test_una_sesion_cerrada_deja_de_ser_vigente(self):
+        # El hilo Chat que seguía en yt-dlp tras desconectar no debe pasar
+        # el guard y aplicar título, historial o «conectado» del vídeo cancelado.
+        registro = RegistroSesiones()
+        sesion = registro.abrir()
+        self.assertTrue(registro.vigente(sesion.gen))
+        registro.cerrar()
+        self.assertFalse(registro.vigente(sesion.gen))
+
 
 class PruebasCableadoConexiones(unittest.TestCase):
     def setUp(self):
@@ -129,6 +138,78 @@ class PruebasCableadoConexiones(unittest.TestCase):
             self.conexiones._conectar_tiktok("pepe")
             callbacks["on_evento"]("Ana", "Hola", main.TIPO_TEXTO, "regalo", "")
         self.assertEqual(difundir.call_args.args[0]["plataforma"], "tiktok")
+
+    def test_youtube_pasa_el_guard_de_sesion_a_obtener_info_video(self):
+        import main
+        recibido = {}
+
+        def info(vid, **kwargs):
+            recibido.update(kwargs)
+            return ("Título", main.deteccion.LIVE, {})
+        with mock.patch.object(main, "obtener_info_video", side_effect=info), \
+                mock.patch.object(main.deteccion, "tiene_chat_en_vivo", return_value=False):
+            self.conexiones._crear_hilo = lambda objetivo, nombre, **kwargs: (
+                HiloEjecuta(objetivo) if nombre == "Chat" else HiloInerte())
+            self.conexiones.conectar("dQw4w9WgXcQ")
+        # Mientras la sesión sigue vigente responde True; al abrir otra, False:
+        # así obtener_info_video deja de encadenar pasos tras desconectar.
+        self.assertTrue(recibido["sesion_activa"]())
+        self.registro.abrir()
+        self.assertFalse(recibido["sesion_activa"]())
+
+    def test_los_detalles_del_directo_se_consultan_nada_mas_conectar(self):
+        import main
+        import wx
+        consultas = []
+        esperas = []
+        hilos = {}
+        frame = mock.Mock()
+        frame._alive = True
+        self.gui_falsa._gui_frame = frame
+
+        class ClienteFalso:
+            def __init__(self, credenciales):
+                pass
+
+            def detalles_directo(self, vid):
+                consultas.append(vid)
+                return {"espectadores": 42, "comienzo": "12:00"}
+
+        def hilo(objetivo, nombre, **kwargs):
+            if nombre == "Chat":
+                return HiloEjecuta(objetivo)
+            hilos[nombre] = objetivo
+            return HiloInerte()
+
+        credenciales_falso = types.SimpleNamespace(hay_lectura=lambda: True,
+                                                   cargar=lambda: {})
+        youtube_api_falso = types.SimpleNamespace(google_disponible=lambda: True,
+                                                  ClienteYouTube=ClienteFalso)
+        llamadas = []
+        with mock.patch.object(main, "obtener_info_video",
+                               return_value=("Título", main.deteccion.LIVE, {})), \
+                mock.patch.object(main.deteccion, "tiene_chat_en_vivo", return_value=True), \
+                mock.patch.object(main, "captura_con_reconexion"), \
+                mock.patch.dict(sys.modules, {"credenciales": credenciales_falso,
+                                              "youtube_api": youtube_api_falso}), \
+                mock.patch.object(wx, "CallAfter",
+                                  side_effect=lambda fn, *a, **k: llamadas.append((fn, a))):
+            self.conexiones._crear_hilo = hilo
+            self.conexiones.conectar("dQw4w9WgXcQ")
+            parada = self.registro.sesiones[0].parada
+
+            def esperar(timeout=None):
+                # La primera espera ya cierra la sesión: el bucle da UNA vuelta.
+                esperas.append(timeout)
+                parada.set()
+                return True
+            with mock.patch.object(parada, "wait", side_effect=esperar):
+                hilos["DetallesDirecto"]()
+
+        # Antes se esperaba un minuto entero antes de la primera consulta.
+        self.assertEqual(consultas, ["dQw4w9WgXcQ"])
+        self.assertEqual(esperas, [60])
+        self.assertIn((frame.set_espectadores, (42,)), llamadas)
 
     def test_youtube_sesion_vieja_no_difunde(self):
         import main

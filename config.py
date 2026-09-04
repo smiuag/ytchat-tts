@@ -62,11 +62,16 @@ def librerias_silenciadas() -> tuple[str, ...]:
 
 def configurar_logging(nivel_consola: int = logging.INFO) -> None:
     root = logging.getLogger()
+    # Idempotente: se marcan los handlers propios y, si ya están puestos, no
+    # se vuelven a añadir (cada línea saldría duplicada en consola y en el log).
+    if any(getattr(h, "_ytchat_propio", False) for h in root.handlers):
+        return
     root.setLevel(logging.DEBUG)
 
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(nivel_consola)
     ch.setFormatter(logging.Formatter("%(asctime)s  %(message)s", datefmt="%H:%M:%S"))
+    ch._ytchat_propio = True
     root.addHandler(ch)
 
     log_path = app_dir() / "ytchat.log"
@@ -365,11 +370,16 @@ def guardar_opcion(ruta: Path | None, seccion: str, clave: str, valor: str) -> N
         stripped = line.strip()
         if stripped.startswith("["):
             if in_sec:
-                if insert_pos is None:
-                    insert_pos = i
                 break
             in_sec = stripped.lower() == f"[{sec_lower}]"
+            if in_sec:
+                insert_pos = i + 1
         elif in_sec:
+            # Los blancos y comentarios del final de la sección no mueven el
+            # punto de inserción: la clave nueva va tras la última clave, no
+            # pegada a la cabecera de la sección siguiente.
+            if not stripped or stripped.startswith(("#", ";")):
+                continue
             k = stripped.split("=", 1)[0].strip().lower() if "=" in stripped else ""
             if k == clave_lower:
                 lines[i] = nueva
@@ -382,6 +392,10 @@ def guardar_opcion(ruta: Path | None, seccion: str, clave: str, valor: str) -> N
     if in_sec:
         if insert_pos is None:
             insert_pos = len(lines)
+        # Si la línea anterior no termina en salto (final de archivo), la
+        # clave nueva quedaría pegada a ella.
+        if insert_pos > 0 and not lines[insert_pos - 1].endswith("\n"):
+            lines[insert_pos - 1] += "\n"
         lines.insert(insert_pos, nueva)
     elif insert_pos is None:
         lines.append(f"\n[{seccion}]\n{nueva}")
@@ -422,6 +436,11 @@ def obtener_opciones_descarga() -> dict:
                    if p.has_section("descargas") else "")
     if not carpeta_raw:
         carpeta = str(app_dir() / "Descargas")
+    elif not Path(carpeta_raw).anchor:
+        # El valor predeterminado es «Descargas» a secas: yt-dlp lo resolvía
+        # contra el directorio de trabajo del proceso, que con un acceso
+        # directo o desde una consola no es la carpeta de la app.
+        carpeta = str(app_dir() / carpeta_raw)
     else:
         carpeta = carpeta_raw
 

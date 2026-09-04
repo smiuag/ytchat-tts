@@ -152,7 +152,12 @@ def iniciar_sesion(client_id: str, client_secret: str) -> str:
     }
     flow = InstalledAppFlow.from_client_config(config, scopes=SCOPES)
     # port=0 -> el SO elige un puerto libre para el redirect del loopback.
+    # prompt=consent: Google solo entrega refresh_token en el primer
+    # consentimiento; tras «Cerrar sesión» y volver a entrar llegaba un token
+    # sin él, to_json() lo omitía y toda escritura fallaba con «Authorized
+    # user info was not in the expected format».
     creds = flow.run_local_server(port=0, open_browser=True,
+                                  prompt="consent",
                                   authorization_prompt_message="",
                                   success_message="Sesión iniciada. Ya puedes "
                                   "volver a la aplicación.")

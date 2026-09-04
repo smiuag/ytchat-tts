@@ -102,8 +102,10 @@ class TTSWorker(threading.Thread):
         self._voz_actual_idx = 0
 
     def run(self):
-        self._init_com()
         try:
+            # Dentro del try: si falta pywin32, la causa llega a _error (y al
+            # log) en vez de un «No se pudo iniciar el motor de voz» genérico.
+            self._init_com()
             self._voz = self._create_voice()
         except Exception as exc:
             self._error = exc
@@ -152,6 +154,11 @@ class TTSWorker(threading.Thread):
     def _hablar(self, texto: str, voz=None) -> None:
         # Multi-voz: si el mensaje pide una voz concreta, se usa; si no, la base.
         self._aplicar_voz_idx(voz if voz is not None else self._voz_base_idx)
+        # Una purga pedida con la voz callada (p. ej. detener_actual() al
+        # reconectar) quedaba armada y cortaba el SIGUIENTE mensaje a los
+        # 100 ms: el primer mensaje de cada reconexión se oía a medias.
+        # No había nada que cortar, así que se descarta antes de hablar.
+        self._purge_pending.clear()
         self._voz.Speak(texto, _SPEAK_FLAGS)
         while True:
             try:
@@ -163,6 +170,8 @@ class TTSWorker(threading.Thread):
             if terminado:
                 break
             self._procesar_comandos()
+            if not self._active.is_set():
+                self._esperar_pausa()
             if self._purge_pending.is_set():
                 self._purge_pending.clear()
                 try:
@@ -170,8 +179,24 @@ class TTSWorker(threading.Thread):
                     self._voz.WaitUntilDone(200)
                 except Exception: pass
                 break
-            if not self._active.is_set():
-                self._active.wait()
+
+    def _esperar_pausa(self) -> None:
+        """Pausa a mitad de frase. Antes el hilo se quedaba en wait() pero
+        SAPI seguía sonando hasta acabar la frase y los comandos (voz,
+        velocidad, volumen, purga) no se atendían hasta reanudar. Ahora se
+        pausa la voz de verdad y se sigue vaciando la cola de comandos."""
+        try:    self._voz.Pause()
+        except Exception as exc:
+            logger.debug("Pause: %s", exc)
+        try:
+            while not self._active.wait(0.1):
+                self._procesar_comandos()
+                if self._purge_pending.is_set():
+                    break   # Alt+D en pausa: se reanuda para poder purgar
+        finally:
+            try:    self._voz.Resume()
+            except Exception as exc:
+                logger.debug("Resume: %s", exc)
 
     def _procesar_comandos(self):
         while not self._cmds.empty():
@@ -216,8 +241,12 @@ class TTSWorker(threading.Thread):
             raise RuntimeError("No hay voces SAPI5.")
         idx = self._resolve_voice(self.config["voz"], voces)
         if idx is None:
+            # Una voz desinstalada no debe impedir arrancar la app (antes:
+            # ValueError → «No se pudo iniciar el motor de voz» y salida).
             nombres = "\n".join(f"  [{i}] {voces.Item(i).GetDescription()}" for i in range(voces.Count))
-            raise ValueError(f"Voz '{self.config['voz']}' no encontrada.\n{nombres}")
+            logger.warning("Voz '%s' no encontrada; se usa la primera disponible.\n%s",
+                           self.config["voz"], nombres)
+            idx = 0
 
         tts.Voice  = voces.Item(idx)
         tts.Volume = self._volume

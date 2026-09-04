@@ -1,6 +1,7 @@
 """Tests del almacén de credenciales (credenciales.py)."""
 
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -59,6 +60,25 @@ class TestCredenciales(unittest.TestCase):
         (Path(self._tmp.name) / "credenciales.json").write_text("{roto", encoding="utf-8")
         d = credenciales.cargar()
         self.assertEqual(d["api_key"], "")
+
+    def test_guardar_no_deja_temporales(self):
+        credenciales.guardar_campo("api_key", "AIzaTEST")
+        self.assertEqual(list(Path(self._tmp.name).glob("*.tmp")), [])
+
+    def test_guardar_campo_desde_varios_hilos_no_pisa_los_otros_campos(self):
+        # guardar_campo es leer-modificar-escribir: sin candado, dos hilos que
+        # escriben campos distintos a la vez se pisan el uno al otro.
+        def escribir(clave, valor):
+            for _ in range(15):
+                credenciales.guardar_campo(clave, valor)
+        hilos = [threading.Thread(target=escribir, args=("api_key", "K")),
+                 threading.Thread(target=escribir, args=("oauth_client_id", "ID"))]
+        for h in hilos:
+            h.start()
+        for h in hilos:
+            h.join()
+        d = credenciales.cargar()
+        self.assertEqual((d["api_key"], d["oauth_client_id"]), ("K", "ID"))
 
 
 if __name__ == "__main__":

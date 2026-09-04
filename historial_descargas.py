@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 
+import archivos
 import diagnostico
 
 logger = diagnostico.obtener_logger(__name__)
@@ -15,20 +15,16 @@ TOPE_ENTRADAS = 200
 
 def cargar(ruta: Path) -> list[dict]:
     """Lee el historial o devuelve una lista vacía si no se puede usar."""
-    try:
-        if ruta.exists():
-            datos = json.loads(ruta.read_text(encoding="utf-8"))
-            return datos if isinstance(datos, list) else []
-    except Exception as exc:
-        logger.debug("cargar historial de descargas: %s", exc)
-    return []
+    datos = archivos.leer_json(ruta, [])
+    if not isinstance(datos, list):
+        return []
+    return [e for e in datos if isinstance(e, dict)]
 
 
 def guardar(ruta: Path, entradas: list[dict]) -> None:
     """Guarda el historial sin impedir las descargas si falla el disco."""
     try:
-        ruta.write_text(json.dumps(entradas, ensure_ascii=False, indent=1),
-                        encoding="utf-8")
+        archivos.escribir_json_atomico(ruta, entradas, indent=1)
     except Exception as exc:
         logger.debug("guardar historial de descargas: %s", exc)
 

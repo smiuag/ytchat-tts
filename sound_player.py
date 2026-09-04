@@ -40,9 +40,10 @@ _sweeper_thread: threading.Thread | None = None
 _sweeper_stop = threading.Event()
 
 # MCI reserva memoria por cada alias abierto. Si nunca los cerramos, se
-# acumulan. Los sonidos duran <0,5 s; 5 s es margen de sobra para cerrar
-# después de que terminen.
-_TTL_ALIAS_SEG = 5.0
+# acumulan. El barrido cierra cada alias cuando MCI dice que ya no suena
+# (`status <alias> mode`); el TTL es solo un tope de seguridad por si MCI no
+# contesta, y es holgado para no cortar temas de usuario largos.
+_TTL_ALIAS_SEG = 30.0
 
 
 def _init_backend() -> None:
@@ -65,6 +66,21 @@ def _init_backend() -> None:
 def _mci(cmd: str) -> int:
     assert _winmm is not None
     return int(_winmm.mciSendStringW(cmd, None, 0, None))
+
+
+def _mci_consulta(cmd: str) -> str:
+    """Comando MCI con respuesta (p. ej. `status x mode`). "" si falla."""
+    assert _winmm is not None
+    import ctypes
+    buf = ctypes.create_unicode_buffer(128)
+    rc = int(_winmm.mciSendStringW(cmd, buf, len(buf), None))
+    return buf.value.strip() if rc == 0 else ""
+
+
+def _alias_vencido(edad_seg: float, modo: str) -> bool:
+    """¿Toca cerrar el alias? Cuando MCI ya no lo da como `playing` (terminó,
+    o no contesta) o cuando supera el tope de seguridad."""
+    return modo.lower() != "playing" or edad_seg >= _TTL_ALIAS_SEG
 
 
 # ── API pública ───────────────────────────────────────────────────────────────
@@ -158,18 +174,29 @@ def _sweeper_loop() -> None:
         if _sweeper_stop.is_set():
             break
         try:
-            now = time.monotonic()
-            cerrar_estos = []
-            with _alias_lock:
-                for alias, ts in list(_alias_activos.items()):
-                    if now - ts >= _TTL_ALIAS_SEG:
-                        cerrar_estos.append(alias)
-                        del _alias_activos[alias]
-            for a in cerrar_estos:
-                try:    _mci(f"close {a}")
-                except Exception: pass
+            _barrer_alias()
         except Exception as exc:
             logger.debug("sweeper: %s", exc)
+
+
+def _barrer_alias() -> None:
+    """Cierra los alias que ya terminaron de sonar (o pasaron el tope)."""
+    now = time.monotonic()
+    with _alias_lock:
+        candidatos = list(_alias_activos.items())
+    cerrar_estos = []
+    for alias, ts in candidatos:
+        # Se pregunta a MCI fuera del candado: la consulta puede tardar.
+        try:    modo = _mci_consulta(f"status {alias} mode")
+        except Exception: modo = ""
+        if _alias_vencido(now - ts, modo):
+            cerrar_estos.append(alias)
+    with _alias_lock:
+        for a in cerrar_estos:
+            _alias_activos.pop(a, None)
+    for a in cerrar_estos:
+        try:    _mci(f"close {a}")
+        except Exception: pass
 
 
 def _reproducir_fallback(ruta: Path) -> None:

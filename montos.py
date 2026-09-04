@@ -23,6 +23,8 @@ _NUM_RE = re.compile(
 # El símbolo/código de divisa es el primer tramo que no sea dígito, espacio,
 # coma o punto: "€", "$", "US$", "¥", "PYG"...
 _DIVISA_RE = re.compile(r"[^\d\s,.]+")
+# Número con un único tipo de separador y solo grupos de tres cifras tras él.
+_MILLARES_RE = re.compile(r"\d{1,3}(?:,\d{3})+|\d{1,3}(?:\.\d{3})+")
 
 
 def parsear_monto(monto: str) -> tuple[str, float] | None:
@@ -43,9 +45,16 @@ def parsear_monto(monto: str) -> tuple[str, float] | None:
             num = num.replace(".", "").replace(",", ".")
         else:
             num = num.replace(",", "")
-    elif "," in num:
-        # Solo coma: la tratamos como separador decimal ("5,00").
-        num = num.replace(",", ".")
+    elif "," in num or "." in num:
+        # Un solo tipo de separador. Si todos los grupos que siguen tienen
+        # exactamente tres cifras es de millar ("1,000", "10.000", "1,234,567"):
+        # YouTube lo usa así en divisas sin decimales (JPY, KRW, IDR) y antes
+        # "¥1,000" sumaba 1. Con una o dos cifras detrás es decimal ("5,00").
+        sep = "," if "," in num else "."
+        if _MILLARES_RE.fullmatch(num):
+            num = num.replace(sep, "")
+        elif sep == ",":
+            num = num.replace(",", ".")
     try:
         valor = float(num)
     except ValueError:

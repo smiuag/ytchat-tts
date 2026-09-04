@@ -88,6 +88,17 @@ class TestPersistencia(unittest.TestCase):
         self.ruta.write_text("no es json {", encoding="utf-8")
         self.assertEqual(h.cargar(self.ruta), [])
 
+    def test_cargar_descarta_entradas_que_no_son_dict(self):
+        # Una lista editada a mano con basura dentro no debe tirar el diálogo.
+        self.ruta.write_text('[{"plataforma": "tiktok", "clave": "pepe"}, "basura", 3, null]',
+                             encoding="utf-8")
+        self.assertEqual(h.cargar(self.ruta), [{"plataforma": "tiktok", "clave": "pepe"}])
+
+    def test_guardar_no_deja_temporales(self):
+        h.guardar(self.ruta, h.upsert([], "tiktok", "pepe", "url", "T", "C"))
+        self.assertTrue(self.ruta.exists())
+        self.assertEqual(list(self.ruta.parent.glob("*.tmp")), [])
+
 
 if __name__ == "__main__":
     unittest.main()

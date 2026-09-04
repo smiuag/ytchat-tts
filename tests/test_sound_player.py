@@ -1,11 +1,56 @@
 """Pruebas del reproductor de sonidos sin usar el backend real."""
 
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 import sound_player
+
+
+class PruebasBarridoAlias(unittest.TestCase):
+    """El barrido cierra un alias cuando MCI dice que terminó, no a los 5 s:
+    un tema de usuario largo se cortaba a mitad."""
+
+    def test_alias_vencido_solo_si_dejo_de_sonar_o_supero_el_tope(self):
+        self.assertFalse(sound_player._alias_vencido(6.0, "playing"))
+        self.assertTrue(sound_player._alias_vencido(0.2, "stopped"))
+        self.assertTrue(sound_player._alias_vencido(0.2, ""))   # MCI no contesta
+        self.assertTrue(sound_player._alias_vencido(
+            sound_player._TTL_ALIAS_SEG + 1, "playing"))
+
+    def test_barrido_cierra_solo_los_alias_que_terminaron(self):
+        modos = {"ytcsnd1": "playing", "ytcsnd2": "stopped"}
+        enviados = []
+
+        def mci(cmd, buf, n, cb):
+            enviados.append(cmd)
+            if cmd.startswith("status "):
+                buf.value = modos[cmd.split()[1]]
+            return 0
+        winmm = mock.Mock()
+        winmm.mciSendStringW.side_effect = mci
+        activos = {"ytcsnd1": time.monotonic(), "ytcsnd2": time.monotonic()}
+        with mock.patch.object(sound_player, "_winmm", winmm), \
+                mock.patch.object(sound_player, "_alias_activos", activos):
+            sound_player._barrer_alias()
+            self.assertEqual(set(sound_player._alias_activos), {"ytcsnd1"})
+        self.assertIn("close ytcsnd2", enviados)
+        self.assertNotIn("close ytcsnd1", enviados)
+
+    def test_barrido_cierra_por_tope_aunque_mci_diga_que_suena(self):
+        def mci(cmd, buf, n, cb):
+            if cmd.startswith("status "):
+                buf.value = "playing"
+            return 0
+        winmm = mock.Mock()
+        winmm.mciSendStringW.side_effect = mci
+        activos = {"ytcsnd1": time.monotonic() - sound_player._TTL_ALIAS_SEG - 1}
+        with mock.patch.object(sound_player, "_winmm", winmm), \
+                mock.patch.object(sound_player, "_alias_activos", activos):
+            sound_player._barrer_alias()
+            self.assertEqual(sound_player._alias_activos, {})
 
 
 class PruebasSoundPlayer(unittest.TestCase):

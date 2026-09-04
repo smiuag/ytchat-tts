@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import re
-import tempfile
 
+import archivos
 from redaccion import MAXIMO_CHAT as MAX_CARACTERES
 
 
@@ -101,7 +100,12 @@ def describir_proximo(mensajes: list[dict], ahora: float) -> str:
     ]
     if not activos:
         return ""
-    restante = min(mensaje["proximo"] for mensaje in activos) - ahora
+    # proximo <= 0 es el valor recién cargado del disco (aún sin cuerda): no
+    # es «en menos de un minuto», es que todavía no se ha programado.
+    con_hora = [mensaje["proximo"] for mensaje in activos if mensaje["proximo"] > 0]
+    if not con_hora:
+        return "Próximo mensaje programado: pendiente de programar"
+    restante = min(con_hora) - ahora
     if restante < 60:
         return "Próximo mensaje programado en menos de un minuto"
     minutos = math.ceil(restante / 60)
@@ -109,9 +113,31 @@ def describir_proximo(mensajes: list[dict], ahora: float) -> str:
     return f"Próximo mensaje programado en {minutos} {unidad}"
 
 
+def _a_bool(valor) -> bool:
+    if isinstance(valor, str):
+        return valor.strip().lower() in ("true", "1", "yes", "si", "sí", "on")
+    return bool(valor)
+
+
 def _normalizar_mensaje(mensaje: dict) -> dict:
     resultado = dict(VALORES_POR_DEFECTO)
     resultado.update(mensaje)
+    # Un JSON editado a mano puede traer "10" o "true": se fuerzan los tipos
+    # de los campos conocidos para que el temporizador de la GUI no reviente
+    # con un TypeError al comparar u operar con ellos.
+    for clave, defecto in VALORES_POR_DEFECTO.items():
+        valor = resultado[clave]
+        try:
+            if isinstance(defecto, bool):
+                resultado[clave] = _a_bool(valor)
+            elif isinstance(defecto, int):
+                resultado[clave] = int(float(valor))   # admite "15" y "15.0"
+            elif isinstance(defecto, float):
+                resultado[clave] = float(valor)
+            else:
+                resultado[clave] = "" if valor is None else str(valor)
+        except (TypeError, ValueError):
+            resultado[clave] = defecto
     return resultado
 
 
@@ -130,23 +156,4 @@ def cargar(ruta) -> list[dict]:
 
 def guardar(ruta, mensajes: list[dict]) -> None:
     """Guarda mensajes mediante un temporal para conservar el archivo anterior."""
-    ruta = os.fspath(ruta)
-    directorio = os.path.dirname(os.path.abspath(ruta))
-    temporal = None
-    try:
-        with tempfile.NamedTemporaryFile(
-                mode="w", encoding="utf-8", dir=directorio,
-                prefix="mensajes_programados_", suffix=".tmp", delete=False) as archivo:
-            temporal = archivo.name
-            json.dump(mensajes, archivo, ensure_ascii=False, indent=2)
-            archivo.write("\n")
-            archivo.flush()
-            os.fsync(archivo.fileno())
-        os.replace(temporal, ruta)
-        temporal = None
-    finally:
-        if temporal is not None:
-            try:
-                os.unlink(temporal)
-            except OSError:
-                pass
+    archivos.escribir_json_atomico(ruta, mensajes, indent=2)

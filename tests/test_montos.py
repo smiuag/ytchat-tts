@@ -48,6 +48,21 @@ class TestParsearMonto(unittest.TestCase):
         self.assertEqual(divisa, "US$")
         self.assertEqual(valor, 3.5)
 
+    def test_millar_con_coma_sin_decimales(self):
+        # Divisas sin decimales: YouTube separa los millares con coma.
+        self.assertEqual(parsear_monto("¥1,000"), ("¥", 1000.0))
+        self.assertEqual(parsear_monto("₩10,000"), ("₩", 10000.0))
+        self.assertEqual(parsear_monto("CA$1,000"), ("CA$", 1000.0))
+        self.assertEqual(parsear_monto("¥1,234,567"), ("¥", 1234567.0))
+
+    def test_millar_con_punto_sin_decimales(self):
+        self.assertEqual(parsear_monto("Rp 15.000"), ("Rp", 15000.0))
+        self.assertEqual(parsear_monto("1.000 €"), ("€", 1000.0))
+
+    def test_una_o_dos_cifras_tras_el_separador_es_decimal(self):
+        self.assertEqual(parsear_monto("1,5 €"), ("€", 1.5))
+        self.assertEqual(parsear_monto("$1.50"), ("$", 1.5))
+
 
 if __name__ == "__main__":
     unittest.main()

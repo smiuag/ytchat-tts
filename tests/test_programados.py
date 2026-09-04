@@ -114,6 +114,17 @@ class TestDescribirProximo(unittest.TestCase):
         self.assertEqual(programados.describir_proximo(mensajes, 0),
                          "Próximo mensaje programado en 6 minutos")
 
+    def test_recien_cargado_sin_cuerda_no_dice_menos_de_un_minuto(self):
+        mensajes = [{"activo": True, "proximo": 0.0}]
+        self.assertEqual(programados.describir_proximo(mensajes, 1000.0),
+                         "Próximo mensaje programado: pendiente de programar")
+
+    def test_ignora_los_sin_cuerda_si_otro_ya_tiene_hora(self):
+        mensajes = [{"activo": True, "proximo": 0.0},
+                    {"activo": True, "proximo": 120.0}]
+        self.assertEqual(programados.describir_proximo(mensajes, 0),
+                         "Próximo mensaje programado en 2 minutos")
+
 
 class TestDescribirMensaje(unittest.TestCase):
     def test_intervalo_fijo_y_estado(self):
@@ -163,6 +174,25 @@ class TestAlmacenamiento(unittest.TestCase):
         self.ruta.write_text('[{"texto": "Hola"}, "basura"]', encoding="utf-8")
         self.assertEqual(programados.cargar(self.ruta), [{
             "texto": "Hola", "minutos_min": 10, "minutos_max": 10,
+            "activo": False, "proximo": 0.0,
+        }])
+
+    def test_cargar_fuerza_los_tipos_de_un_json_editado_a_mano(self):
+        # "10" o "true" en el JSON hacían TypeError en el temporizador de la GUI.
+        self.ruta.write_text(
+            '[{"texto": 5, "minutos_min": "10", "minutos_max": "15.0",'
+            ' "activo": "true", "proximo": "0"}]', encoding="utf-8")
+        self.assertEqual(programados.cargar(self.ruta), [{
+            "texto": "5", "minutos_min": 10, "minutos_max": 15,
+            "activo": True, "proximo": 0.0,
+        }])
+
+    def test_cargar_repone_el_valor_por_defecto_si_no_se_puede_convertir(self):
+        self.ruta.write_text(
+            '[{"texto": null, "minutos_min": "muchos", "activo": null, "proximo": []}]',
+            encoding="utf-8")
+        self.assertEqual(programados.cargar(self.ruta), [{
+            "texto": "", "minutos_min": 10, "minutos_max": 10,
             "activo": False, "proximo": 0.0,
         }])
 

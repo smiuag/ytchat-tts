@@ -1,7 +1,10 @@
 """Tests de la lógica pura de tiktok_captura (detección de URLs y errores)."""
 
+import threading
 import unittest
+from unittest import mock
 
+import tiktok_captura
 from tiktok_captura import (usuario_de_url, _mensaje_error, _es_error_permanente,
                             _mejor_flujo, autor_de_evento)
 
@@ -68,6 +71,61 @@ class TestMensajesDeError(unittest.TestCase):
         exc = self._exc("SignAPIError", "sign server unavailable")
         self.assertFalse(_es_error_permanente(exc))
         self.assertIn("firmas", _mensaje_error(exc))
+
+    def test_404_del_servidor_de_firmas_no_es_usuario_inexistente(self):
+        # httpx: «404 Not Found for url …eulerstream…». Antes, por la subcadena
+        # «not found», se anunciaba usuario inexistente y se dejaba de reintentar.
+        exc = self._exc("HTTPStatusError",
+                        "Client error '404 Not Found' for url "
+                        "'https://tiktok.eulerstream.com/webcast/sign_url'")
+        self.assertFalse(_es_error_permanente(exc))
+        self.assertNotIn("No se encontró", _mensaje_error(exc))
+        self.assertIn("firmas", _mensaje_error(exc))
+
+    def test_error_http_generico_es_transitorio(self):
+        exc = self._exc("HTTPStatusError",
+                        "Client error '404 Not Found' for url 'https://www.tiktok.com/x'")
+        self.assertFalse(_es_error_permanente(exc))
+        self.assertIn("HTTP", _mensaje_error(exc))
+
+    def test_la_subcadena_sola_no_hace_permanente_un_error(self):
+        self.assertFalse(_es_error_permanente(Exception("user not found")))
+        self.assertFalse(_es_error_permanente(Exception("stream offline")))
+
+
+class TestReconexion(unittest.TestCase):
+
+    def _correr(self, sesion, max_intentos=3):
+        estados = []
+        with mock.patch.object(tiktok_captura, "disponible", return_value=True), \
+                mock.patch.object(tiktok_captura, "_sesion", side_effect=sesion):
+            tiktok_captura.capturar_con_reconexion(
+                "pepe", {"max_intentos": max_intentos, "espera_entre_intentos": 0},
+                threading.Event(), on_evento=lambda *a: None,
+                on_estado=lambda tipo, texto: estados.append((tipo, texto)))
+        return estados
+
+    def test_los_intentos_se_reinician_tras_cada_reconexion(self):
+        caidas = [0]
+
+        def sesion(usuario, parada, on_evento, on_estado, on_info, on_espectadores,
+                   anunciar_entradas=False):
+            caidas[0] += 1
+            on_estado("conectado", "ok")
+            if caidas[0] >= 6:
+                parada.set()
+            return RuntimeError("microcorte")
+
+        estados = self._correr(sesion, max_intentos=3)
+        self.assertEqual(caidas[0], 6)
+        self.assertFalse(any("agotaron" in texto for _, texto in estados))
+
+    def test_los_fallos_seguidos_si_agotan_los_intentos(self):
+        def sesion(*args, **kwargs):
+            return RuntimeError("no conecta")
+
+        estados = self._correr(sesion, max_intentos=3)
+        self.assertTrue(any("agotaron los 3" in texto for _, texto in estados))
 
 
 class TestMejorFlujo(unittest.TestCase):

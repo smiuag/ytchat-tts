@@ -54,6 +54,16 @@ _TIPO_MAP = {
 
 _mutex_handle = None
 
+_ERROR_ACCESS_DENIED = 5      # el mutex existe pero es de otro usuario / instancia elevada
+_ERROR_ALREADY_EXISTS = 183   # el mutex ya lo tiene otra instancia de este usuario
+
+
+def _hay_otra_instancia(error: int) -> bool:
+    """Decide, a partir de GetLastError tras CreateMutexW, si ya hay otra
+    instancia. ACCESS_DENIED también cuenta: el mutex existe (lo creó una
+    instancia elevada o de otro usuario) aunque no nos dejen abrirlo."""
+    return error in (_ERROR_ALREADY_EXISTS, _ERROR_ACCESS_DENIED)
+
 
 def _verificar_instancia_unica() -> bool:
     global _mutex_handle
@@ -62,8 +72,10 @@ def _verificar_instancia_unica() -> bool:
         # use_last_error + get_last_error: leer GetLastError «a mano» tras una
         # llamada ctypes no es fiable (el propio ctypes puede pisarlo entre medias).
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # Sin restype ctypes devuelve un int de 32 bits y trunca el HANDLE en x64.
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
         _mutex_handle = kernel32.CreateMutexW(None, False, "YTChatTTS_SingleInstance_Mutex")
-        if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+        if _hay_otra_instancia(ctypes.get_last_error()):
             return False
     except Exception:
         pass  # fuera de Windows, dejamos que arranque igualmente
@@ -136,10 +148,6 @@ def _parsear_titulo(html: str) -> str:
     return ""
 
 
-def obtener_titulo(video_id: str, timeout: float = 8.0) -> str:
-    return _parsear_titulo(_descargar_watch(video_id, timeout))
-
-
 def _clasificar_por_api(video_id: str) -> str:
     """Reserva: si hay API key, clasifica con la Data API. Si no, desconocido."""
     try:
@@ -207,7 +215,7 @@ def _info_video_con_modulo(video_id: str) -> dict:
             download=False, process=False)
 
 
-def obtener_info_video(video_id: str) -> tuple[str, str, dict]:
+def obtener_info_video(video_id: str, sesion_activa=None) -> tuple[str, str, dict]:
     """Devuelve (titulo, tipo, metadatos). tipo: live/upcoming/vod/desconocido.
 
     El módulo yt-dlp tarda 2,19 s y 1,69 s, frente a 5,28 s y 7,05 s del
@@ -215,8 +223,18 @@ def obtener_info_video(video_id: str) -> tuple[str, str, dict]:
     consentimiento que YouTube sirve al scraping directo, y traen `title`,
     `live_status` y la metadata del panel de información (canal, vistas,
     descripción…). Si fallan los dos, se cae al scraping (que puede no funcionar
-    y deja la metadata vacía, con solo el título si se pudo sacar)."""
+    y deja la metadata vacía, con solo el título si se pudo sacar).
+
+    sesion_activa() (opcional) se consulta entre paso y paso: si el usuario
+    desconectó mientras tanto, no tiene sentido encadenar el ejecutable y el
+    scraping (hasta 20 s más) y el hilo Chat debe morir cuanto antes; si no,
+    el cierre de la app destruye la ventana con el hilo aún en código nativo."""
     fallos = []
+    cancelado = ("", deteccion.DESCONOCIDO, {})
+
+    def _cancelada():
+        return sesion_activa is not None and not sesion_activa()
+
     try:
         info = _info_video_con_modulo(video_id)
         if isinstance(info, dict):
@@ -227,6 +245,8 @@ def obtener_info_video(video_id: str) -> tuple[str, str, dict]:
     except Exception as exc:
         logger.debug("obtener_info_video (yt-dlp módulo): %s", exc)
         fallos.append(exc)
+    if _cancelada():
+        return cancelado
 
     # El módulo evita arrancar y desempaquetar el ejecutable en cada conexión.
     try:
@@ -239,6 +259,8 @@ def obtener_info_video(video_id: str) -> tuple[str, str, dict]:
     except Exception as exc:
         logger.debug("obtener_info_video (yt-dlp ejecutable): %s", exc)
         fallos.append(exc)
+    if _cancelada():
+        return cancelado
 
     html = _descargar_watch(video_id, al_fallar=fallos.append)
     titulo = _parsear_titulo(html)
@@ -288,7 +310,7 @@ def _resolver_live_chat_id(video_id: str) -> None:
         import wx
         import gui as _gm
         if _gm._gui_frame and _gm._gui_frame._alive:
-            wx.CallAfter(_gm._gui_frame.set_live_chat_id, lcid, causa)
+            wx.CallAfter(_gm._gui_frame.set_live_chat_id, lcid, causa, video_id)
     except Exception as exc:
         logger.debug("resolver_live_chat_id: %s", exc)
 
@@ -417,9 +439,22 @@ def captura_con_reconexion(video_id, cola, config, parada, stats, on_message=Non
     sesion_activa() (opcional) dice si esta sesión sigue siendo la vigente: un
     hilo viejo que despierta tarde no debe encolar TTS de la sesión anterior."""
     intentos = 0
+    conecto = [False]
+
+    def _estado(tipo, texto):
+        # Se intercepta «conectado» para contar solo los fallos SEGUIDOS: un
+        # directo largo con microcortes sueltos no debe agotar max_intentos.
+        if tipo == "conectado":
+            conecto[0] = True
+        if on_estado:
+            on_estado(tipo, texto)
+
     while not parada.is_set():
-        err = _captura(video_id, cola, config, parada, stats, on_message, on_estado,
+        conecto[0] = False
+        err = _captura(video_id, cola, config, parada, stats, on_message, _estado,
                        sesion_activa)
+        if conecto[0]:
+            intentos = 0
         if parada.is_set():
             break
         if not config["reconectar"]:
@@ -471,7 +506,22 @@ def _cliente_pytchat():
 
 def _captura(video_id, cola, config, parada, stats, on_message=None, on_estado=None,
              sesion_activa=None):
-    asyncio.set_event_loop(asyncio.new_event_loop())
+    # pytchat necesita un loop de asyncio en el hilo. Uno por intento y se
+    # cierra al salir: si no, cada reconexión dejaba un loop (y su selector)
+    # abiertos para siempre.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return _captura_en_loop(video_id, cola, config, parada, stats, on_message,
+                                on_estado, sesion_activa)
+    finally:
+        try:    loop.close()
+        except Exception: pass
+        asyncio.set_event_loop(None)
+
+
+def _captura_en_loop(video_id, cola, config, parada, stats, on_message, on_estado,
+                     sesion_activa):
     try:
         import pytchat
     except ImportError:

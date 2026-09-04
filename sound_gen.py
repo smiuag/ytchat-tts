@@ -87,22 +87,6 @@ def _detune(freq, dur, amp=AMP, cents=7.0, fn=_triangular):
     return _suma(fn(freq, dur, amp), fn(f2, dur, amp))
 
 
-def _envolvente(muestras, ataque=0.01, caida=0.05):
-    # Fade lineal de entrada y salida: sin esto, el corte brusco produce un
-    # click audible. Útil para tonos sostenidos.
-    n = len(muestras)
-    if n == 0:
-        return muestras
-    na = min(max(1, int(SR * ataque)), n // 2)
-    nc = min(max(1, int(SR * caida)),  n // 2)
-    out = list(muestras)
-    for i in range(na):
-        out[i] *= i / na
-    for i in range(nc):
-        out[n - 1 - i] *= i / nc
-    return out
-
-
 def _perc(muestras, ataque=0.004, tau=0.10):
     # Ataque rápido + caída EXPONENCIAL (e^-t/τ): imita cómo decae un sonido
     # real (campana, pulsación). Más natural y "premium" que el fade lineal

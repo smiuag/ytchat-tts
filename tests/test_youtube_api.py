@@ -205,7 +205,7 @@ class TestCableadoChatDirecto(unittest.TestCase):
         }
         with mock.patch.dict(sys.modules, modulos):
             main._resolver_live_chat_id("abc")
-        self.assertEqual(llamadas, [("", "chat_desactivado")])
+        self.assertEqual(llamadas, [("", "chat_desactivado", "abc")])
 
 
 if __name__ == "__main__":

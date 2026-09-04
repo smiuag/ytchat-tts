@@ -38,5 +38,11 @@ class RegistroSesiones:
         return True
 
     def vigente(self, gen: int) -> bool:
-        """Indica si ``gen`` sigue siendo el de la sesión activa."""
-        return self._vigente is not None and self._vigente.gen == gen
+        """Indica si ``gen`` sigue siendo el de la sesión activa y sin parar.
+
+        Una sesión cerrada con ``cerrar()`` deja de ser vigente: si no, el
+        hilo Chat que seguía en yt-dlp tras desconectar pasaba el guard y
+        aplicaba título, historial y «conectado» de un vídeo ya cancelado.
+        """
+        return (self._vigente is not None and self._vigente.gen == gen
+                and not self._vigente.parada.is_set())

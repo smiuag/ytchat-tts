@@ -45,6 +45,11 @@ class TestHistorialDescargas(unittest.TestCase):
                      "estado": "completado", "carpeta": "C:/Descargas"}]
         historial.guardar(self.ruta, entradas)
         self.assertEqual(historial.cargar(self.ruta), entradas)
+        self.assertEqual(list(self.ruta.parent.glob("*.tmp")), [])
+
+    def test_cargar_descarta_entradas_que_no_son_dict(self):
+        self.ruta.write_text('[{"nombre": "a"}, "basura"]', encoding="utf-8")
+        self.assertEqual(historial.cargar(self.ruta), [{"nombre": "a"}])
 
 
 if __name__ == "__main__":

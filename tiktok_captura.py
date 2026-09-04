@@ -291,23 +291,42 @@ def _sesion(usuario, parada, on_evento, on_estado, on_info, on_espectadores,
     return error[0]
 
 
+# Excepciones de TikTokLive que no vale la pena reintentar. Se comparan por
+# NOMBRE de clase (la librería es opcional, no se importa aquí) y no por
+# subcadena del mensaje: un «404 Not Found» del servidor de firmas es un
+# httpx.HTTPStatusError transitorio, no un usuario inexistente.
+_CLASES_OFFLINE = ("UserOfflineError",)
+_CLASES_NO_EXISTE = ("UserNotFoundError",)
+
+
+def _nombre(exc) -> str:
+    return type(exc).__name__
+
+
+def _es_error_http(exc) -> bool:
+    n = _nombre(exc).lower()
+    return "http" in n or n.endswith("statuserror")
+
+
 def _mensaje_error(exc) -> str:
-    t = f"{type(exc).__name__}: {exc}".lower()
-    if "offline" in t or "not live" in t or "not currently live" in t:
+    nombre = _nombre(exc)
+    t = f"{nombre}: {exc}".lower()
+    if nombre in _CLASES_OFFLINE:
         return "Ese usuario de TikTok no está en directo ahora mismo."
-    if "notfound" in t or "not found" in t or "user_not_found" in t:
+    if nombre in _CLASES_NO_EXISTE:
         return "No se encontró ese usuario de TikTok. Revisa la URL."
     if "sign" in t or "euler" in t or "rate" in t and "limit" in t:
         return ("El servidor de firmas de TikTok no responde o alcanzó su "
                 "límite. Espera un momento y reintenta.")
     if "captcha" in t or "blocked" in t:
         return "TikTok pidió verificación (captcha). Reintenta más tarde."
+    if _es_error_http(exc):
+        return f"TikTok no respondió bien (error HTTP): {exc}"
     return f"No se pudo conectar al directo de TikTok: {exc}"
 
 
 def _es_error_permanente(exc) -> bool:
-    t = f"{type(exc).__name__}: {exc}".lower()
-    return any(p in t for p in ("offline", "not live", "notfound", "not found"))
+    return _nombre(exc) in _CLASES_OFFLINE + _CLASES_NO_EXISTE
 
 
 def capturar_con_reconexion(usuario, config, parada, on_evento,
@@ -325,11 +344,24 @@ def capturar_con_reconexion(usuario, config, parada, on_evento,
         return
 
     intentos = 0
+    conecto = [False]
+
+    def _estado(tipo, texto):
+        # Se intercepta «conectado» para contar solo los fallos SEGUIDOS: un
+        # directo largo con microcortes sueltos no debe agotar max_intentos.
+        if tipo == "conectado":
+            conecto[0] = True
+        if on_estado:
+            on_estado(tipo, texto)
+
     while not parada.is_set():
         if on_estado:
             on_estado("conectando", f"Conectando al directo de TikTok de @{usuario}...")
-        err = _sesion(usuario, parada, on_evento, on_estado, on_info, on_espectadores,
+        conecto[0] = False
+        err = _sesion(usuario, parada, on_evento, _estado, on_info, on_espectadores,
                       anunciar_entradas=bool(config.get("tiktok_anunciar_entradas")))
+        if conecto[0]:
+            intentos = 0
         if parada.is_set():
             break
         if err is not None and _es_error_permanente(err):
