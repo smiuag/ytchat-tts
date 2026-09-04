@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -75,6 +76,21 @@ class TestConstruirOuttmpl(unittest.TestCase):
                          Path("/tmp/Descargas"))
     def test_con_enumerar(self):
         self.assertIn("playlist_index", construir_outtmpl({"carpeta": "/tmp"}, True))
+
+    def test_enumerar_no_deja_na_en_videos_sueltos(self):
+        # «%(playlist_index)02d» a secas daba «NA - Título» fuera de una playlist.
+        salida = Path(construir_outtmpl({"carpeta": "/tmp"}, True)).name
+        self.assertTrue(salida.startswith("%(playlist_index&{:02d} - |)s"), salida)
+        try:
+            from yt_dlp import YoutubeDL
+        except Exception:
+            return
+        ydl = YoutubeDL({"quiet": True})
+        suelto = ydl.evaluate_outtmpl(salida, {"title": "T", "id": "x", "ext": "mp4"})
+        en_lista = ydl.evaluate_outtmpl(
+            salida, {"title": "T", "id": "x", "ext": "mp4", "playlist_index": 3})
+        self.assertEqual(suelto, "T [x].mp4")
+        self.assertEqual(en_lista, "03 - T [x].mp4")
     def test_carpeta_por_defecto(self): self.assertIn("Descargas", construir_outtmpl({}, False))
     def test_carpeta_windows(self): self.assertIn("Descargas", construir_outtmpl({"carpeta": r"C:\Users\foo\Descargas"}, False))
 
@@ -108,6 +124,25 @@ class TestAnalizarUrl(unittest.TestCase):
             res = analizar_url("https://example.com/v")
         self.assertIn("inválida", res["mensaje"])
 
+    def test_pide_un_unico_json_plano_con_tope(self):
+        # --dump-json emitía un JSON por entrada en las playlists («Extra data»).
+        with mock.patch.object(descargas.ytdlp_bin, "ruta_ytdlp", return_value="yt-dlp"), \
+                mock.patch.object(descargas.subprocess, "run",
+                                  return_value=self.resultado({"id": "abc"})) as run:
+            analizar_url("https://example.com/lista")
+        args = run.call_args.args[0]
+        self.assertIn("-J", args)
+        self.assertIn("--flat-playlist", args)
+        self.assertNotIn("--dump-json", args)
+        self.assertEqual(run.call_args.kwargs["timeout"], descargas.TIEMPO_ESPERA_ANALISIS)
+
+    def test_tope_agotado_es_error_y_no_revienta(self):
+        with mock.patch.object(descargas.ytdlp_bin, "ruta_ytdlp", return_value="yt-dlp"), \
+                mock.patch.object(descargas.subprocess, "run",
+                                  side_effect=descargas.subprocess.TimeoutExpired("yt-dlp", 60)):
+            res = analizar_url("https://example.com/v")
+        self.assertEqual(res["tipo"], "error")
+
 
 class TestArgumentosDescarga(unittest.TestCase):
     def opciones(self, formato): return {"formato": formato, "bitrate": 256, "carpeta": "/tmp"}
@@ -132,16 +167,26 @@ class TestArgumentosDescarga(unittest.TestCase):
         indice = args.index("--ffmpeg-location")
         self.assertEqual(args[indice:indice + 2], ["--ffmpeg-location", r"C:\ffmpeg"])
 
-    def test_sin_empaquetar_no_agrega_ffmpeg(self):
-        args = argumentos_descarga("url", self.opciones("mp3"), False)
+    def test_sin_ffmpeg_resuelto_no_agrega_ffmpeg(self):
+        with mock.patch.object(descargas.ffmpeg_bin, "ruta_ffmpeg", return_value=None):
+            args = argumentos_descarga("url", self.opciones("mp3"), False)
         self.assertNotIn("--ffmpeg-location", args)
 
-    def test_empaquetado_usa_directorio_de_la_app(self):
-        with mock.patch.object(descargas.sys, "frozen", True, create=True), \
-                mock.patch.object(descargas, "app_dir", return_value=Path(r"C:\app")):
+    def test_usa_el_resolvedor_unico_de_ffmpeg(self):
+        with mock.patch.object(descargas.ffmpeg_bin, "ruta_ffmpeg",
+                               return_value=r"C:\app\ffmpeg.exe"):
             args = argumentos_descarga("url", self.opciones("mp3"), False)
         indice = args.index("--ffmpeg-location")
-        self.assertEqual(args[indice + 1], r"C:\app")
+        self.assertEqual(args[indice + 1], r"C:\app\ffmpeg.exe")
+
+    def test_pide_la_ruta_final_sin_perder_el_progreso(self):
+        # --print implica --quiet, que apaga el progreso: --progress lo recupera.
+        args = argumentos_descarga("url", self.opciones("mp4"), False)
+        indice = args.index("--print")
+        self.assertEqual(args[indice + 1],
+                         f"after_move:{descargas.PREFIJO_RUTA_FINAL} %(filepath)s")
+        self.assertIn("--progress", args)
+        self.assertIn("--progress-template", args)
 
 
 class TestDescargar(unittest.TestCase):
@@ -165,6 +210,40 @@ class TestDescargar(unittest.TestCase):
                       lambda *a: estados.append(a), threading.Event())
         self.assertEqual(progresos, [(50.0, 2.0, 3, "nombre con espacios.mp4")])
         self.assertEqual(estados[-1], ("completado", ""))
+
+    def test_la_ruta_final_reemplaza_el_nombre_del_fragmento(self):
+        proceso = self.proceso([
+            "PROG 5 10 NA 2 3 C:/d/video [x].f140.m4a\n",
+            f"{descargas.PREFIJO_RUTA_FINAL} C:/d/video [x].mp4\n",
+        ])
+        progresos = []; estados = []
+        with self.preparar(proceso)[0], self.preparar(proceso)[1], self.preparar(proceso)[2]:
+            descargar("url", {"formato": "mp4"}, lambda *a: progresos.append(a),
+                      lambda *a: estados.append(a), threading.Event())
+        self.assertEqual(progresos[-1], (100.0, None, None, "video [x].mp4"))
+        self.assertEqual(estados[-1], ("completado", ""))
+
+    def test_cancelar_borra_los_restos_de_la_carpeta(self):
+        with tempfile.TemporaryDirectory() as carpeta:
+            base = Path(carpeta) / "Vídeo [abc]"
+            restos = [base.with_name(base.name + ".f140.m4a.part"),
+                      base.with_name(base.name + ".f137.mp4"),
+                      base.with_name(base.name + ".mp4.ytdl")]
+            intactos = [base.with_name(base.name + ".mp4"),
+                        Path(carpeta) / "Otro [zzz].mp4.part"]
+            for ruta in restos + intactos:
+                ruta.write_bytes(b"x")
+            proceso = self.proceso([
+                f"PROG 5 10 NA 2 3 {base}.f140.m4a\n",
+                f"PROG 6 10 NA 2 3 {base}.f140.m4a\n",
+            ])
+            evento = threading.Event(); estados = []
+            with self.preparar(proceso)[0], self.preparar(proceso)[1], self.preparar(proceso)[2]:
+                descargar("url", {"formato": "mp4", "carpeta": carpeta},
+                          lambda *a: evento.set(), lambda *a: estados.append(a), evento)
+            self.assertEqual(estados[-1], ("cancelado", "Descarga cancelada"))
+            self.assertFalse(any(ruta.exists() for ruta in restos))
+            self.assertTrue(all(ruta.exists() for ruta in intactos))
 
     def test_ignora_lineas_no_progreso(self):
         proceso = self.proceso(["[youtube] Extracting URL\n"])
@@ -288,8 +367,93 @@ class TestDescargar(unittest.TestCase):
         self.assertEqual(estados[-1][0], "error")
 
 
+class TestMatarArbol(unittest.TestCase):
+    """kill() solo mata a yt-dlp; el ffmpeg hijo seguía uniendo audio y vídeo."""
+
+    def test_en_windows_baja_el_arbol_con_taskkill_y_luego_kill(self):
+        proceso = mock.Mock(pid=1234)
+        with mock.patch.object(descargas.os, "name", "nt"), \
+                mock.patch.object(descargas.subprocess, "run") as run:
+            descargas._matar_arbol(proceso)
+        self.assertEqual(run.call_args.args[0],
+                         ["taskkill", "/T", "/F", "/PID", "1234"])
+        proceso.kill.assert_called_once()
+
+    def test_si_taskkill_falla_igual_hace_kill(self):
+        proceso = mock.Mock(pid=1234)
+        with mock.patch.object(descargas.os, "name", "nt"), \
+                mock.patch.object(descargas.subprocess, "run", side_effect=OSError("no")):
+            descargas._matar_arbol(proceso)
+        proceso.kill.assert_called_once()
+
+    def test_sin_pid_real_no_lanza_taskkill(self):
+        proceso = mock.Mock()   # pid es un Mock, como en las demás pruebas
+        with mock.patch.object(descargas.subprocess, "run") as run:
+            descargas._matar_arbol(proceso)
+        run.assert_not_called()
+        proceso.kill.assert_called_once()
+
+
+class TestLimpiarRestos(unittest.TestCase):
+
+    def test_nombre_base_quita_fragmento_part_y_extension(self):
+        for nombre in ("C:/d/Título [id].f140.m4a.part", "Título [id].f137.mp4",
+                       "Título [id].mp4.ytdl", "Título [id].mp4", "Título [id].mp4.part"):
+            self.assertEqual(descargas.nombre_base_descarga(nombre), "Título [id]", nombre)
+
+    def test_sin_nombre_no_borra_nada(self):
+        with tempfile.TemporaryDirectory() as carpeta:
+            (Path(carpeta) / "a.part").write_bytes(b"x")
+            self.assertEqual(descargas.limpiar_restos_descarga(carpeta, ""), [])
+            self.assertTrue((Path(carpeta) / "a.part").exists())
+
+    def test_borra_solo_temporales_de_esa_descarga(self):
+        with tempfile.TemporaryDirectory() as carpeta:
+            nombres = ["V [id].f140.m4a.part", "V [id].f137.mp4", "V [id].mp4.ytdl",
+                       "V [id].mp4.part", "V [id].mp4", "V [id].jpg", "W [id].mp4.part"]
+            for nombre in nombres:
+                (Path(carpeta) / nombre).write_bytes(b"x")
+            borrados = descargas.limpiar_restos_descarga(carpeta, "V [id].f140.m4a")
+            self.assertEqual(sorted(borrados), ["V [id].f137.mp4", "V [id].f140.m4a.part",
+                                                "V [id].mp4.part", "V [id].mp4.ytdl"])
+            self.assertEqual(sorted(r.name for r in Path(carpeta).iterdir()),
+                             ["V [id].jpg", "V [id].mp4", "W [id].mp4.part"])
+
+    def test_carpeta_inexistente_no_revienta(self):
+        self.assertEqual(descargas.limpiar_restos_descarga("/no/existe", "a.mp4"), [])
+
+
 class TestGestorDescargas(unittest.TestCase):
     def opciones(self): return {"formato": "mp4", "bitrate": 192, "carpeta": "/tmp"}
+
+    def test_cancelar_durante_el_analisis_no_lanza_la_descarga(self):
+        gestor = GestorDescargas(self.opciones())
+        seguir = threading.Event()
+        estados = []
+        terminado = threading.Event()
+
+        def analizar(_url):
+            seguir.wait(1)
+            return {"tipo": "video"}
+
+        def estado(_id, valor, _mensaje):
+            estados.append(valor)
+            terminado.set()
+
+        with mock.patch.object(descargas, "analizar_url", side_effect=analizar), \
+                mock.patch.object(descargas, "descargar") as descargar_mock:
+            item_id = gestor.encolar("url", lambda *a: None, estado)
+            gestor.cancelar(item_id)
+            seguir.set()
+            self.assertTrue(terminado.wait(1))
+        descargar_mock.assert_not_called()
+        self.assertEqual(estados, ["cancelado"])
+
+    def test_el_item_lleva_la_carpeta_elegida_al_encolar(self):
+        gestor = GestorDescargas(self.opciones())
+        with mock.patch.object(descargas.ytdlp_bin, "ruta_ytdlp", return_value=None):
+            id_ = gestor.encolar("url", lambda *a: None, lambda *a: None)
+        self.assertEqual(gestor.obtener(id_).carpeta, "/tmp")
     def test_encolar_almacena_item(self):
         gestor = GestorDescargas(self.opciones())
         with mock.patch.object(descargas.ytdlp_bin, "ruta_ytdlp", return_value=None):
@@ -360,6 +524,24 @@ class TestGestorUnico(unittest.TestCase):
                                  lambda *_: None)
             self.assertTrue(terminado.wait(1))
         self.assertEqual(estados, ["completado"])
+
+    def test_suscriptor_recibe_el_item_para_el_historial(self):
+        recibidos = []
+        gestor_prueba = GestorDescargas({"formato": "mp4", "carpeta": "/tmp"})
+        gestor_prueba.suscribir_fin(lambda *args: recibidos.append(args))
+        terminado = threading.Event()
+
+        def descarga_simulada(_url, _opciones, _progreso, estado, _cancelar):
+            estado("completado", "")
+            terminado.set()
+
+        with mock.patch.object(descargas, "analizar_url", return_value={}), \
+                mock.patch.object(descargas, "descargar", descarga_simulada):
+            item_id = gestor_prueba.encolar("https://youtu.be/abc", lambda *_: None,
+                                            lambda *_: None)
+            self.assertTrue(terminado.wait(1))
+        estado, _mensaje, _nombre, item = recibidos[-1]
+        self.assertEqual((estado, item.id, item.carpeta), ("completado", item_id, "/tmp"))
 
     def test_suscriptor_con_error_no_impide_a_los_demas(self):
         estados = []

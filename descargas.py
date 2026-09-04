@@ -17,9 +17,8 @@ from __future__ import annotations
 import logging
 import json
 import os
-import shutil
+import re
 import subprocess
-import sys
 import threading
 import time
 import uuid
@@ -30,6 +29,7 @@ from urllib.parse import parse_qs, urlparse
 
 import diagnostico
 from config import app_dir, obtener_opciones_descarga
+import ffmpeg_bin
 import ytdlp_bin
 from progreso_ytdlp import PLANTILLA, analizar_linea_progreso
 
@@ -45,19 +45,91 @@ class ItemDescarga:
     progreso: float = 0.0    # 0..100
     mensaje: str = ""
     nombre: str = ""
+    carpeta: str = ""        # destino elegido al encolar (para el historial)
 
 
 # ── Helpers puros (testeables en Linux) ──────────────────────────────────────
 
 INTERVALO_PROGRESO_S = 0.5
+# Tope del análisis previo de la URL: sin él, una red caída dejaba el ítem
+# «en cola» para siempre.
+TIEMPO_ESPERA_ANALISIS = 60
+# Marca con la que yt-dlp imprime la ruta definitiva (tras unir audio y
+# vídeo o convertir): así se distingue de cualquier otra línea de salida.
+PREFIJO_RUTA_FINAL = "RUTA_FINAL"
+# Sufijo de fragmento DASH que deja yt-dlp: «.f140.m4a», «.f137.mp4.part»…
+_RE_FRAGMENTO = re.compile(r"^\.f[\w-]+\.[A-Za-z0-9]+(\.part|\.ytdl)?$")
+
+
+def _matar_arbol(proceso) -> None:
+    """Mata a yt-dlp Y a su ffmpeg hijo. En Windows kill() solo mata al
+    padre: el ffmpeg que estaba uniendo audio y vídeo seguía vivo y escribiendo
+    en la carpeta. taskkill /T baja el árbol entero; kill() queda de red."""
+    pid = getattr(proceso, "pid", None)
+    if os.name == "nt" and isinstance(pid, int):
+        try:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)],
+                           capture_output=True, timeout=10, check=False,
+                           creationflags=_sin_ventana())
+        except Exception as exc:
+            logger.debug("taskkill: %s", exc)
+    try:
+        proceso.kill()
+    except Exception as exc:
+        logger.debug("kill: %s", exc)
 
 
 def _vigilar_cancelacion(proceso, cancel_event, intervalo=0.2) -> bool:
     while proceso.poll() is None:
         if cancel_event.wait(intervalo):
-            proceso.kill()
+            _matar_arbol(proceso)
             return True
     return False
+
+
+def nombre_base_descarga(nombre_archivo: str) -> str:
+    """«Título [id].f140.m4a.part» → «Título [id]»: lo que comparten todos
+    los archivos (fragmentos, .part, .ytdl) de una misma descarga."""
+    nombre = Path(nombre_archivo).name
+    for sufijo in (".part", ".ytdl"):
+        if nombre.endswith(sufijo):
+            nombre = nombre[: -len(sufijo)]
+    fragmento = re.search(r"\.f[\w-]+\.[A-Za-z0-9]+$", nombre)
+    if fragmento:
+        return nombre[: fragmento.start()]
+    return Path(nombre).stem
+
+
+def limpiar_restos_descarga(carpeta, nombre_archivo: str) -> list[str]:
+    """Borra lo que una descarga cancelada deja en su carpeta.
+
+    Conservador a propósito: solo archivos de ESA carpeta cuyo nombre empiece
+    por el nombre base de la descarga y sean claramente temporales (.part,
+    .ytdl o un fragmento .fNNN.ext). Un archivo ya terminado no se toca.
+    Devuelve los nombres borrados.
+    """
+    base = nombre_base_descarga(nombre_archivo) if nombre_archivo else ""
+    if not base:
+        return []
+    borrados = []
+    try:
+        entradas = list(Path(carpeta).iterdir())
+    except OSError:
+        return []
+    for ruta in entradas:
+        nombre = ruta.name
+        if not nombre.startswith(base) or not ruta.is_file():
+            continue
+        resto = nombre[len(base):]
+        if not (resto.endswith(".part") or resto.endswith(".ytdl")
+                or _RE_FRAGMENTO.match(resto)):
+            continue
+        try:
+            ruta.unlink()
+            borrados.append(nombre)
+        except OSError as exc:
+            logger.debug("no se pudo borrar %s: %s", nombre, exc)
+    return borrados
 
 
 def debe_emitir_progreso(ultimo_ts, ahora, pct):
@@ -100,12 +172,13 @@ def construir_outtmpl(opciones: dict, enumerar: bool) -> str:
     """Plantilla de nombre de archivo para yt-dlp.
 
     El directorio se pasa en `opciones["carpeta"]`; yt-dlp lo une con el nombre.
-    Con `enumerar=True` yt-dlp prefijará 01_, 02_, etc. SOLO si el resultado es
-    una playlist; en vídeos sueltos el prefijo no aparece.
+    Con `enumerar=True` yt-dlp prefijará «01 - », «02 - », etc. SOLO si el
+    resultado es una playlist; en vídeos sueltos el prefijo no aparece (el
+    condicional «&…|» de yt-dlp; un %(playlist_index)02d a secas daba «NA - »).
     """
     carpeta = str(opciones.get("carpeta") or (app_dir() / "Descargas"))
     if enumerar:
-        nombre = "%(playlist_index)02d - %(title)s [%(id)s].%(ext)s"
+        nombre = "%(playlist_index&{:02d} - |)s%(title)s [%(id)s].%(ext)s"
     else:
         nombre = "%(title)s [%(id)s].%(ext)s"
     return str(Path(carpeta) / nombre)
@@ -121,12 +194,14 @@ def analizar_url(url: str) -> dict:
     if ruta is None:
         return {"tipo": "error", "id": "", "titulo": "", "cuenta": 0,
                 "mensaje": "yt-dlp no está instalado"}
+    # -J (un único JSON) y --flat-playlist: --dump-json emitía un JSON por
+    # entrada en las playlists y json.loads fallaba con «Extra data».
     try:
         resultado = subprocess.run(
-            [ruta, "--dump-json", "--quiet", "--no-warnings", "--skip-download",
-             "--no-playlist", "--socket-timeout", "20", url],
+            [ruta, "-J", "--flat-playlist", "--quiet", "--no-warnings",
+             "--skip-download", "--no-playlist", "--socket-timeout", "20", url],
             capture_output=True, text=True, creationflags=_sin_ventana(),
-            check=False,
+            check=False, timeout=TIEMPO_ESPERA_ANALISIS,
         )
         if resultado.returncode:
             return {"tipo": "error", "id": "", "titulo": "", "cuenta": 0,
@@ -160,14 +235,19 @@ def argumentos_descarga(url, opciones, enumerar, ffmpeg_location=None) -> list[s
     """Arma los argumentos de una descarga, sin ejecutar programas."""
     f = (opciones.get("formato") or "mp4").lower().strip()
     bitrate = int(opciones.get("bitrate") or 192)
-    argumentos = ["--newline", "--no-warnings", "--progress-template", PLANTILLA,
+    # --print after_move: el nombre que llega por el progreso es el del
+    # fragmento («….f140.m4a»); el definitivo solo se sabe tras unir o
+    # convertir. --print implica --quiet, y --progress recupera el progreso.
+    argumentos = ["--newline", "--no-warnings", "--progress",
+                  "--progress-template", PLANTILLA,
+                  "--print", f"after_move:{PREFIJO_RUTA_FINAL} %(filepath)s",
                   "-f", formato_a_ydl(f, bitrate), "-o",
                   construir_outtmpl(opciones, enumerar)]
     if f in ("mp3", "m4a"):
         argumentos.extend(["-x", "--audio-format", f,
                            "--audio-quality", f"{bitrate}K"])
-    if ffmpeg_location is None and getattr(sys, "frozen", False):
-        ffmpeg_location = app_dir()
+    if ffmpeg_location is None:
+        ffmpeg_location = ffmpeg_bin.ruta_ffmpeg()
     if ffmpeg_location is not None:
         argumentos.extend(["--ffmpeg-location", str(ffmpeg_location)])
     argumentos.extend(["--", url])
@@ -207,6 +287,16 @@ def descargar(url: str, opciones: dict,
 
     enumerar = bool(opciones.get("enumerar", False))
     ultimo_progreso_ts = None
+    ultimo_archivo = ""   # último nombre visto en el progreso: base de la limpieza
+    carpeta = Path(construir_outtmpl(opciones, enumerar)).parent
+
+    def cancelar(proceso) -> None:
+        _matar_arbol(proceso)
+        proceso.wait()
+        borrados = limpiar_restos_descarga(carpeta, ultimo_archivo)
+        if borrados:
+            logger.info("descarga cancelada: borrados %d restos", len(borrados))
+        estado_cb("cancelado", "Descarga cancelada")
 
     estado_cb("descargando", "")
     try:
@@ -216,9 +306,7 @@ def descargar(url: str, opciones: dict,
             creationflags=_sin_ventana(),
         )
         if cancel_event.is_set():
-            proceso.kill()
-            proceso.wait()
-            estado_cb("cancelado", "Descarga cancelada")
+            cancelar(proceso)
             return
         diagnostico.crear_hilo(
             _vigilar_cancelacion, "Vigilante-cancelacion",
@@ -226,13 +314,22 @@ def descargar(url: str, opciones: dict,
         ).start()
         for linea in iter(proceso.stdout.readline, ""):
             if cancel_event.is_set():
-                proceso.kill()
-                proceso.wait()
-                estado_cb("cancelado", "Descarga cancelada")
+                cancelar(proceso)
                 return
+            if linea.startswith(PREFIJO_RUTA_FINAL + " "):
+                # Ruta definitiva: se anuncia y persiste el nombre real, no
+                # el del fragmento temporal.
+                ruta_final = linea[len(PREFIJO_RUTA_FINAL) + 1:].strip()
+                if ruta_final:
+                    try:
+                        progreso_cb(100.0, None, None, Path(ruta_final).name)
+                    except Exception as exc:
+                        logger.debug("progreso_cb lanzó: %s", exc)
+                continue
             datos = analizar_linea_progreso(linea)
             if datos is None:
                 continue
+            ultimo_archivo = datos["nombre"]
             ahora = time.monotonic()
             if not debe_emitir_progreso(ultimo_progreso_ts, ahora, datos["pct"]):
                 continue
@@ -244,6 +341,7 @@ def descargar(url: str, opciones: dict,
                 logger.debug("progreso_cb lanzó: %s", exc)
         proceso.wait()
         if cancel_event.is_set():
+            limpiar_restos_descarga(carpeta, ultimo_archivo)
             estado_cb("cancelado", "Descarga cancelada")
         elif proceso.returncode == 0:
             estado_cb("completado", "")
@@ -258,12 +356,8 @@ def descargar(url: str, opciones: dict,
 
 
 def tiene_ffmpeg() -> bool:
-    """¿Hay ffmpeg disponible? Busca junto al .exe (frozen) o en el PATH."""
-    if getattr(sys, "frozen", False):
-        nombre = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
-        if (app_dir() / nombre).exists():
-            return True
-    return shutil.which("ffmpeg") is not None
+    """¿Hay ffmpeg disponible? El mismo resolvedor que usa la descarga."""
+    return ffmpeg_bin.ruta_ffmpeg() is not None
 
 
 def frase_aviso_descarga(estado: str, mensaje: str, nombre: str) -> str:
@@ -301,7 +395,12 @@ class GestorDescargas:
             self._opciones = dict(op)
 
     def suscribir_fin(self, callback: Callable) -> None:
-        """Añade un aviso de estado sin duplicarlo."""
+        """Añade un aviso de estado sin duplicarlo.
+
+        `callback(estado, mensaje, nombre, item)` corre en el HILO DE DESCARGA:
+        quien toque wx debe pasar por wx.CallAfter. Recibe el ItemDescarga
+        para que el historial se registre aunque el diálogo esté cerrado.
+        """
         with self._lock:
             if callback not in self._suscriptores_fin:
                 self._suscriptores_fin.append(callback)
@@ -314,7 +413,10 @@ class GestorDescargas:
         `estado_cb(item_id, estado, mensaje)` reciben el id del ítem.
         """
         item_id = uuid.uuid4().hex[:12]
-        it = ItemDescarga(id=item_id, url=url, tipo="video", nombre=url)
+        with self._lock:
+            carpeta = str(self._opciones.get("carpeta") or "")
+        it = ItemDescarga(id=item_id, url=url, tipo="video", nombre=url,
+                          carpeta=carpeta)
         ev = threading.Event()
         with self._lock:
             self._items[item_id] = it
@@ -338,7 +440,7 @@ class GestorDescargas:
                 suscriptores = list(self._suscriptores_fin)
             for suscriptor in suscriptores:
                 try:
-                    suscriptor(estado, mensaje, nombre)
+                    suscriptor(estado, mensaje, nombre, it)
                 except Exception as exc:
                     logger.warning("suscriptor de descarga lanzó: %s", exc)
             if estado in ("completado", "cancelado", "error"):
@@ -361,6 +463,10 @@ class GestorDescargas:
                 titulo = info.get("titulo") or ""
                 if titulo:
                     _cb_progreso(it.progreso, "", "", titulo)
+                if ev.is_set():
+                    # Cancelada durante el análisis: no lanzar yt-dlp para nada.
+                    _cb_estado("cancelado", "Descarga cancelada")
+                    return
                 logger.info("descarga %s: inicio", item_id)
                 descargar(url, self._opciones, _cb_progreso, _cb_estado, ev)
             except Exception as exc:
