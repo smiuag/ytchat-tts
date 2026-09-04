@@ -58,8 +58,18 @@ class TestDestinoAcumulado(unittest.TestCase):
                 destino = destino_acumulado(None, base, delta, dur)
                 self.assertLessEqual(destino, base)
 
-    def test_retroceso_con_duracion_atrasada_recorta_por_duracion(self):
-        self.assertEqual(destino_acumulado(None, 3_615_868, -10_000, 3_600_000), 3_600_000)
+    def test_retroceso_con_duracion_atrasada_no_recorta_por_duracion(self):
+        # La duración que da VLC va por detrás de la posición: el retroceso
+        # pedido se respeta en vez de saltar hasta esa duración.
+        self.assertEqual(destino_acumulado(None, 3_615_868, -10_000, 3_600_000), 3_605_868)
+
+    def test_retroceso_en_directo_con_duracion_falsa(self):
+        # Caso real del registro: pos 2:08:57, VLC decía dur=15:00 y un
+        # retroceso de 1 min acababa en 15:00 (casi dos horas atrás).
+        self.assertEqual(destino_acumulado(None, 7_737_861, -60_000, 900_000), 7_677_861)
+
+    def test_avance_con_duracion_falsa_no_pasa_de_la_base(self):
+        self.assertEqual(destino_acumulado(None, 7_737_861, 60_000, 900_000), 7_737_861)
 
     def test_retroceso_respeta_limite_cero(self):
         self.assertEqual(destino_acumulado(None, 5_000, -10_000, 60_000), 0)

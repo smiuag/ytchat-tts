@@ -183,11 +183,19 @@ def _registro_detallado_activo() -> bool:
 # Alturas de vídeo que ofrecemos como «calidad», de mayor a menor.
 _CALIDADES = [2160, 1440, 1080, 720, 480, 360, 240, 144]
 
+# Recargas automáticas seguidas de un directo cuyo relevo se interrumpió.
+TOPE_RECARGAS_DIRECTO = 2
+
 
 def _info_video(video_id: str) -> dict:
     """Datos de yt-dlp del vídeo (bloquea; usar en hilo)."""
-    info = ytdlp_bin.info_video(video_id)
-    if info is not None:
+    if ytdlp_bin.ruta_ytdlp() is not None:
+        # Con programa disponible se confía en él: si falla o agota sus 30 s,
+        # repetir con el módulo sumaba otros 20-30 s de «Cargando vídeo…»
+        # para acabar en el mismo error.
+        info = ytdlp_bin.info_video(video_id)
+        if info is None:
+            raise RuntimeError("el programa yt-dlp no devolvió datos del vídeo")
         return info
     import yt_dlp
     # socket_timeout: sin él, una red lenta deja la app colgada en «Cargando
@@ -295,9 +303,13 @@ def _preferir_hls(formatos: list) -> list:
     (.m3u8) y variantes «DASH en crudo» (protocol=https/http_dash_segments):
     una URL que exige el manejo de secuencias propio de yt-dlp y que ni VLC
     ni ffmpeg saben leer bien solos («Invalid data found», comprobado). Si
-    hay HLS, se usa esa familia; si no hay ninguna, se deja la lista igual."""
+    hay HLS con vídeo, se usa esa familia; si no, se deja la lista igual:
+    quedarse con una familia HLS de solo audio dejaría el directo sin imagen
+    (y el audio se resuelve aparte, ver fuentes_para_directo)."""
     hls = [f for f in formatos if "m3u8" in (f.get("protocol") or "")]
-    return hls or list(formatos)
+    if any(f.get("vcodec") not in (None, "none") for f in hls):
+        return hls
+    return list(formatos)
 
 
 def fuentes_para_directo(info: dict) -> tuple[str, str]:
@@ -309,7 +321,10 @@ def fuentes_para_directo(info: dict) -> tuple[str, str]:
     info_hls = {**info, "formats": _preferir_hls(info.get("formats") or [])}
     url, progresivo = _video_para_altura(info_hls, 10_000)
     if url:
-        return url, "" if progresivo else _mejor_audio(info_hls)
+        # Si la familia HLS trae vídeo pero ningún audio suelto, el directo
+        # quedaba mudo: se cae al mejor audio de la lista completa.
+        return url, "" if progresivo else (_mejor_audio(info_hls)
+                                          or _mejor_audio(info))
 
     video = audio = ""
     for formato in info.get("requested_formats", []) or []:
@@ -506,7 +521,9 @@ class ReproductorPanel(wx.Panel):
         self._muted = False
         # Botones de control ocultables (opción minimalista). El estado se guarda
         # en config; la ventana sincroniza el menú y persiste vía on_botones_toggle.
-        self._botones_visibles = bool(config.get("mostrar_botones_reproductor", False))
+        # El fallback coincide con config_predeterminada (true): un config sin
+        # la clave no debe esconder los botones.
+        self._botones_visibles = bool(config.get("mostrar_botones_reproductor", True))
         self.on_botones_toggle = None
         self._calidad_sel = None
         self._alturas = []
@@ -530,6 +547,9 @@ class ReproductorPanel(wx.Panel):
         # sincronía entre dos HLS independientemente en vivo cada 60-90 s.
         self._relevo_ffmpeg = None
         self._relevo_gen = 0
+        # Recargas automáticas seguidas tras interrumpirse un directo por
+        # relevo (ver _directo_interrumpido). Se reinicia al cambiar de vídeo.
+        self._recargas_directo = 0
 
         self.SetBackgroundColour(_T.bg)
         self.SetForegroundColour(_T.text)
@@ -930,6 +950,7 @@ class ReproductorPanel(wx.Panel):
         nombre_accesible(self.sld_vol, "Volumen del reproductor")
         row.Add(self.sld_vol, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 12)
         self.lbl_estado = wx.StaticText(self, label="Sin reproducir.", name="EstadoReproductor")
+        self._texto_estado = "Sin reproducir."
         self.lbl_estado.SetForegroundColour(_T.accent)
         row.Add(self.lbl_estado, 1, wx.ALIGN_CENTER_VERTICAL)
         box.Add(row, 0, wx.EXPAND | wx.ALL, 6)
@@ -969,7 +990,8 @@ class ReproductorPanel(wx.Panel):
         self._timer_progreso = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self._on_timer_progreso, self._timer_progreso)
 
-        # Aplicar el estado guardado (por defecto, botones ocultos = minimalista).
+        # Aplicar el estado guardado (por defecto, botones visibles; el usuario
+        # los oculta desde el interruptor, el menú o Preferencias).
         self._aplicar_visibilidad_botones()
 
     def _on_resize(self, event):
@@ -984,11 +1006,19 @@ class ReproductorPanel(wx.Panel):
             return
         try:
             ancho = max(150, self.GetClientSize().Width - 40)
+            # Wrap() mete saltos de línea literales en la etiqueta y solo
+            # estrecha, nunca ensancha: al agrandar la ventana el texto seguía
+            # partido. Se parte siempre desde el texto original.
+            texto = getattr(self, "_texto_estado", None)
+            if texto is None:
+                texto = self.lbl_estado.GetLabel()
+            self.lbl_estado.SetLabel(texto)
             self.lbl_estado.Wrap(ancho)
         except Exception:
             pass
 
     def _fijar_estado(self, texto: str) -> None:
+        self._texto_estado = texto
         self.lbl_estado.SetLabel(texto)
         self._ajustar_ancho_estado()
 
@@ -1087,6 +1117,7 @@ class ReproductorPanel(wx.Panel):
         self._info = None
         self._calidad_sel = None
         self._alturas = []
+        self._recargas_directo = 0
         if self._video_id and autoplay:
             self.cargar(reproducir=True)
         else:
@@ -1341,13 +1372,21 @@ class ReproductorPanel(wx.Panel):
             relevo_gen = self._relevo_gen
             gen = self._gen
             video_id_actual = self._video_id
+            # Mientras el relevo se prepara la carga sigue en curso: sin esto,
+            # pulsar Reproducir en ese segundo veía «sin medio», relanzaba
+            # yt-dlp y mataba el relevo recién arrancado.
+            self._cargando = True
             self._fijar_estado("Cargando vídeo…")
 
             def _preparar_relevo(video_url=url, audio_url=slave):
                 relevo = relevo_ffmpeg.RelevoFfmpeg(video_url, audio_url)
                 direccion = relevo.iniciar()
-                if direccion:
-                    time.sleep(relevo_ffmpeg.TIEMPO_ESPERA_LISTENER)
+                # Esperar a que ffmpeg escuche de verdad (sondea el puerto),
+                # no un tiempo fijo: VLC hace una única conexión y, si llega
+                # antes que el listener, queda en «error» sin reintentar.
+                if direccion and not relevo.esperar_listo():
+                    relevo.detener()
+                    direccion = None
                 wx.CallAfter(self._relevo_listo, relevo, direccion, relevo_gen,
                             gen, video_id_actual, video_url, audio_url, reproducir)
 
@@ -1363,6 +1402,13 @@ class ReproductorPanel(wx.Panel):
                 or video_id_actual != self._video_id:
             relevo.detener()
             return
+        self._cargando = False
+        if direccion is not None and not relevo.activo():
+            # ffmpeg murió entre el listener y este callback (403 de
+            # googlevideo, playlist inválida): no darle a VLC una dirección
+            # donde nadie escucha.
+            relevo.detener()
+            direccion = None
         if direccion is None:
             # No se pudo levantar el relevo (sin ffmpeg, puerto, etc.): se
             # sigue con input-slave directo, como antes de tener el relevo.
@@ -1371,6 +1417,7 @@ class ReproductorPanel(wx.Panel):
             self._continuar_reproducir_calidad(url, slave, True, reproducir)
             return
         self._relevo_ffmpeg = relevo
+        self._relevo_reintentos = 0
         self._tiene_esclavo = False
         self._continuar_reproducir_calidad(direccion, "", True, reproducir)
 
@@ -1397,6 +1444,7 @@ class ReproductorPanel(wx.Panel):
             logger.warning("reproducir: %s", exc)
             if hasattr(self, "_estado_inicio"):
                 self._estado_inicio.cancelar()
+            self._detener_relevo_ffmpeg()
             self._error_carga()
             return
         self._pos_ms = self._dur_ms = 0
@@ -1471,6 +1519,7 @@ class ReproductorPanel(wx.Panel):
         self._cargando = False
         if hasattr(self, "_estado_inicio"):
             self._estado_inicio.cancelar()
+        self._detener_relevo_ffmpeg()
         self._timer_progreso.Stop()
         import sound_player as _snd
         _snd.reproducir("error")
@@ -1570,6 +1619,7 @@ class ReproductorPanel(wx.Panel):
                 anunciar("Reanudando")
         elif accion == "cargar":
             if self._video_id:
+                self._recargas_directo = 0   # recarga manual: cuenta desde cero
                 self.cargar(reproducir=True)
             elif self._url_flujo:
                 self._reproducir_flujo()
@@ -1717,12 +1767,17 @@ class ReproductorPanel(wx.Panel):
     def _fijar_tiempo(self, pos_ms, dur_ms, mover_slider, anunciar_t):
         self._pos_ms = int(pos_ms or 0)
         self._dur_ms = int(dur_ms or 0)
-        if self._dur_ms > 0:
+        if self._dur_ms > 0 and self._pos_ms <= self._dur_ms:
             self.lbl_tiempo.SetLabel(f"{_fmt_t(self._pos_ms)} / {_fmt_t(self._dur_ms)}")
+        elif self._dur_ms > 0:
+            # VLC da a veces una duración menor que la posición en directos
+            # (visto: 2:08:57 con dur=15:00): no fiarse del total ni sacar
+            # el deslizador de su rango 0-1000.
+            self.lbl_tiempo.SetLabel(_fmt_t(self._pos_ms))
         else:
             self.lbl_tiempo.SetLabel("En directo")
         if mover_slider and self._dur_ms > 0:
-            self.sld_pos.SetValue(int(self._pos_ms / self._dur_ms * 1000))
+            self.sld_pos.SetValue(max(0, min(1000, int(self._pos_ms / self._dur_ms * 1000))))
         if anunciar_t:
             anunciar(_fmt_hablado(self._pos_ms))
 
@@ -1807,12 +1862,12 @@ class ReproductorPanel(wx.Panel):
     def _on_sld_pos(self, event):
         if self._player is None:
             return
+        if not self._busqueda_permitida_actual():
+            self._aviso_busqueda_no_permitida()
+            return
         dur = self._player.get_length()
         if dur <= 0:
             logger.debug("%s", traza_sin_barra("deslizador", dur))
-            return
-        if not self._busqueda_permitida_actual():
-            anunciar("No se puede mover este vídeo mientras usa la fuente de internet")
             return
         bus = self._estado_busqueda
         destino = int(self.sld_pos.GetValue() / 1000.0 * dur)
@@ -1841,13 +1896,13 @@ class ReproductorPanel(wx.Panel):
     def _buscar_porcentaje(self, pct):
         if self._player is None:
             return
+        if not self._busqueda_permitida_actual():
+            self._aviso_busqueda_no_permitida()
+            return
         dur = self._player.get_length()
         if dur <= 0:
             logger.debug("%s", traza_sin_barra("porcentaje", dur))
             self._aviso_sin_barra()
-            return
-        if not self._busqueda_permitida_actual():
-            anunciar("No se puede mover este vídeo mientras usa la fuente de internet")
             return
         bus = self._estado_busqueda
         destino = int(dur * pct / 100)
@@ -1929,9 +1984,64 @@ class ReproductorPanel(wx.Panel):
                 self._timer.Stop()
             except Exception:
                 pass
-        if self._estado_vlc_actual() == "ended":
-            self._detener(silencioso=True)
-            anunciar("Fin del vídeo")
+        if estado_final == "ended":
+            if getattr(self, "_relevo_ffmpeg", None) is not None \
+                    and self._es_directo_actual():
+                self._directo_interrumpido()
+            else:
+                self._detener(silencioso=True)
+                anunciar("Fin del vídeo")
+        elif estado_final == "error":
+            self._fallo_reproduccion()
+
+    def _directo_interrumpido(self) -> None:
+        """El relevo de ffmpeg terminó (fin del directo, URL de googlevideo
+        caducada a las ~6 h, corte de red) y VLC vio un fin de archivo:
+        anunciarlo como «Fin del vídeo» engañaba. Se avisa y se recarga una
+        vez sola (cargar() resuelve URLs frescas), con tope de recargas
+        seguidas para no entrar en bucle si el directo de verdad acabó."""
+        recargas = getattr(self, "_recargas_directo", 0)
+        self._detener(silencioso=True)
+        anunciar("El directo se interrumpió")
+        if recargas >= TOPE_RECARGAS_DIRECTO:
+            logger.warning("DIRECTO_INTERRUMPIDO sin recargar recargas=%d", recargas)
+            self._fijar_estado("El directo se interrumpió.")
+            return
+        self._recargas_directo = recargas + 1
+        logger.warning("DIRECTO_INTERRUMPIDO recarga=%d", self._recargas_directo)
+        self.cargar(reproducir=True)
+
+    def _fallo_reproduccion(self) -> None:
+        """VLC quedó en «error» (no pudo abrir la fuente). Antes no se
+        trataba: el temporizador seguía muestreando y el usuario oía
+        «Cargando vídeo» y luego nada. Con el relevo de ffmpeg se reintenta
+        la conexión unas veces mientras ffmpeg siga vivo; si no, se para y
+        se avisa."""
+        relevo = getattr(self, "_relevo_ffmpeg", None)
+        reintentos = getattr(self, "_relevo_reintentos", 0)
+        if relevo is not None and relevo.activo() and reintentos < 3:
+            self._relevo_reintentos = reintentos + 1
+            logger.warning("REPRODUCCION_ERROR relevo reintento=%d",
+                           self._relevo_reintentos)
+            try:
+                self._player.play()
+                return
+            except Exception as exc:
+                logger.debug("reintento tras error: %s", exc)
+        logger.warning("REPRODUCCION_ERROR topologia=%s relevo_activo=%s",
+                       self._topologia_actual(),
+                       relevo.activo() if relevo is not None else "no")
+        self._detener(silencioso=True)
+        import sound_player as _snd
+        _snd.reproducir("error")
+        self._fijar_estado("No se pudo reproducir el vídeo.")
+        anunciar("No se pudo reproducir el vídeo")
+
+    def _aviso_busqueda_no_permitida(self) -> None:
+        if getattr(self, "_relevo_ffmpeg", None) is not None:
+            anunciar("En este directo no se puede adelantar ni retroceder")
+        else:
+            anunciar("No se puede mover este vídeo mientras usa la fuente de internet")
 
     def _buscar_rel(self, delta_ms: int):
         if self._player is None:
@@ -1940,13 +2050,16 @@ class ReproductorPanel(wx.Panel):
             if aviso:
                 anunciar(aviso)
             return
+        # La permisión va antes que la duración: con el relevo de ffmpeg VLC
+        # devuelve length=0 y, mirando primero dur, el aviso específico de
+        # «no se puede buscar en este directo» no llegaba nunca.
+        if not self._busqueda_permitida_actual():
+            self._aviso_busqueda_no_permitida()
+            return
         dur = self._player.get_length()
         if dur <= 0:
             logger.debug("%s", traza_sin_barra("relativo", dur))
             self._aviso_sin_barra()
-            return
-        if not self._busqueda_permitida_actual():
-            anunciar("No se puede mover este vídeo mientras usa la fuente de internet")
             return
         bus = self._estado_busqueda
         pos = bus.confirmada

@@ -129,10 +129,18 @@ class TestPreferirHls(unittest.TestCase):
     def test_hay_hls_se_queda_solo_con_esas(self):
         formatos = [
             {"protocol": "https", "url": "dash-crudo"},
-            {"protocol": "m3u8_native", "url": "hls"},
+            {"protocol": "m3u8_native", "vcodec": "avc1", "url": "hls"},
         ]
         self.assertEqual(reproductor._preferir_hls(formatos),
-                         [{"protocol": "m3u8_native", "url": "hls"}])
+                         [{"protocol": "m3u8_native", "vcodec": "avc1", "url": "hls"}])
+
+    def test_hls_solo_de_audio_no_filtra(self):
+        # Quedarse con una familia HLS sin vídeo dejaría el directo sin imagen.
+        formatos = [
+            {"protocol": "https", "vcodec": "avc1", "acodec": "none", "url": "dash-video"},
+            {"protocol": "m3u8_native", "vcodec": "none", "acodec": "mp4a", "url": "hls-audio"},
+        ]
+        self.assertEqual(reproductor._preferir_hls(formatos), formatos)
 
     def test_sin_hls_deja_la_lista_igual(self):
         formatos = [{"protocol": "https", "url": "dash-crudo"}]
@@ -166,6 +174,28 @@ class TestFuentesParaDirecto(unittest.TestCase):
         self.assertEqual(
             reproductor.fuentes_para_directo(info),
             ("video-hls", "audio-hls"))
+
+    def test_hls_con_video_pero_sin_audio_toma_el_audio_de_la_lista_completa(self):
+        # Antes: _mejor_audio sobre la familia HLS devolvía "" y el directo
+        # sonaba mudo aunque hubiera un audio DASH disponible.
+        info = {"formats": [
+            {"vcodec": "avc1", "acodec": "none", "height": 720,
+             "protocol": "m3u8_native", "url": "video-hls"},
+            {"vcodec": "none", "acodec": "mp4a", "protocol": "https",
+             "url": "audio-dash"},
+        ]}
+        self.assertEqual(reproductor.fuentes_para_directo(info),
+                         ("video-hls", "audio-dash"))
+
+    def test_hls_solo_de_audio_no_deja_el_directo_sin_video(self):
+        info = {"formats": [
+            {"vcodec": "avc1", "acodec": "none", "height": 720,
+             "protocol": "https", "url": "video-dash"},
+            {"vcodec": "none", "acodec": "mp4a", "protocol": "m3u8_native",
+             "url": "audio-hls"},
+        ]}
+        self.assertEqual(reproductor.fuentes_para_directo(info),
+                         ("video-dash", "audio-hls"))
 
     def test_url_superior_gana_sobre_las_demás_fuentes(self):
         info = {
@@ -348,18 +378,32 @@ class TestInfoVideo(unittest.TestCase):
 
     def test_info_video_con_programa_no_importa_el_modulo(self):
         info = {"formats": [{"vcodec": "avc1", "height": 1080}]}
-        with mock.patch.object(reproductor.ytdlp_bin, "info_video", return_value=info), \
+        with mock.patch.object(reproductor.ytdlp_bin, "ruta_ytdlp", return_value="yt-dlp.exe"), \
+                mock.patch.object(reproductor.ytdlp_bin, "info_video", return_value=info), \
                 mock.patch.dict(sys.modules, {"yt_dlp": None}):
             self.assertIs(info, reproductor._info_video("A" * 11))
 
     def test_info_video_sin_programa_usa_el_modulo(self):
         modulo = types.SimpleNamespace(YoutubeDL=_YoutubeDL)
-        with mock.patch.object(reproductor.ytdlp_bin, "info_video", return_value=None), \
+        with mock.patch.object(reproductor.ytdlp_bin, "ruta_ytdlp", return_value=None), \
+                mock.patch.object(reproductor.ytdlp_bin, "info_video", return_value=None) as programa, \
                 mock.patch.dict(sys.modules, {"yt_dlp": modulo}):
             self.assertEqual(
                 {"formats": [{"vcodec": "avc1", "height": 720}]},
                 reproductor._info_video("A" * 11),
             )
+        programa.assert_not_called()
+
+    def test_info_video_con_programa_que_falla_no_reintenta_con_el_modulo(self):
+        # El programa agotó sus 30 s (o falló): repetir con el módulo sumaba
+        # otros 20-30 s de «Cargando vídeo…» para el mismo desenlace.
+        modulo = types.SimpleNamespace(YoutubeDL=mock.Mock())
+        with mock.patch.object(reproductor.ytdlp_bin, "ruta_ytdlp", return_value="yt-dlp.exe"), \
+                mock.patch.object(reproductor.ytdlp_bin, "info_video", return_value=None), \
+                mock.patch.dict(sys.modules, {"yt_dlp": modulo}):
+            with self.assertRaises(RuntimeError):
+                reproductor._info_video("A" * 11)
+        modulo.YoutubeDL.assert_not_called()
 
 
 class TestAvisoReproductor(unittest.TestCase):
@@ -780,6 +824,253 @@ class TestAvisoAlReproducir(unittest.TestCase):
         with mock.patch.object(reproductor, "anunciar") as anunciar:
             panel._toggle_play()
         anunciar.assert_not_called()
+
+
+class TestRelevoRobustez(unittest.TestCase):
+    """Caminos de fallo del relevo de ffmpeg: listener que no llega, ffmpeg
+    que muere, VLC en «error», excepción al abrir el medio."""
+
+    INFO = {"is_live": True, "formats": [], "requested_formats": [
+        {"vcodec": "avc1", "acodec": "none", "url": "video-solicitado"},
+        {"vcodec": "none", "acodec": "mp4a", "url": "audio-solicitado"},
+    ]}
+
+    def _panel(self):
+        panel = reproductor.ReproductorPanel.__new__(reproductor.ReproductorPanel)
+        panel._info = dict(self.INFO)
+        panel._inst = mock.Mock()
+        panel._inst.media_new.return_value = mock.Mock()
+        panel._player = mock.Mock()
+        panel._vol = 75
+        panel._muted = False
+        panel._timer = mock.Mock()
+        panel.lbl_estado = mock.Mock()
+        panel._video_id = "vid"
+        panel._gen = 0
+        panel._relevo_gen = 0
+        panel._relevo_ffmpeg = None
+        panel._cargando = False
+        panel._asegurar_player = mock.Mock(return_value=True)
+        panel._error_carga = mock.Mock()
+        panel._mostrar_pausa = mock.Mock()
+        panel._fijar_estado = mock.Mock()
+        panel._detener = mock.Mock()
+        panel._topologia_actual = mock.Mock(return_value="relevo")
+        return panel
+
+    def _sincrono(self):
+        return (
+            mock.patch.object(reproductor.diagnostico, "crear_hilo",
+                              side_effect=lambda target, _n: mock.Mock(start=target)),
+            mock.patch.object(reproductor.wx, "CallAfter",
+                              side_effect=lambda fn, *a: fn(*a)),
+        )
+
+    def _relevo(self, direccion="tcp://127.0.0.1:5555", listo=True, activo=True):
+        relevo = mock.Mock()
+        relevo.iniciar.return_value = direccion
+        relevo.esperar_listo.return_value = listo
+        relevo.activo.return_value = activo
+        return relevo
+
+    def test_si_el_listener_no_llega_se_mata_el_relevo_y_cae_a_input_slave(self):
+        panel = self._panel()
+        relevo = self._relevo(listo=False)
+        hilo, callafter = self._sincrono()
+        with hilo, callafter, mock.patch.object(
+                reproductor.relevo_ffmpeg, "RelevoFfmpeg", return_value=relevo):
+            panel._reproducir_calidad(None, reproducir=False)
+        relevo.detener.assert_called_once()
+        panel._inst.media_new.assert_called_once_with("video-solicitado")
+        self.assertIsNone(panel._relevo_ffmpeg)
+        self.assertTrue(panel._tiene_esclavo)
+        self.assertFalse(panel._cargando)
+
+    def test_si_ffmpeg_murio_antes_del_callback_no_se_usa_su_direccion(self):
+        panel = self._panel()
+        relevo = self._relevo(activo=False)
+        hilo, callafter = self._sincrono()
+        with hilo, callafter, mock.patch.object(
+                reproductor.relevo_ffmpeg, "RelevoFfmpeg", return_value=relevo):
+            panel._reproducir_calidad(None, reproducir=False)
+        relevo.detener.assert_called_once()
+        panel._inst.media_new.assert_called_once_with("video-solicitado")
+        self.assertIsNone(panel._relevo_ffmpeg)
+
+    def test_la_carga_sigue_en_curso_mientras_el_relevo_se_prepara(self):
+        panel = self._panel()
+        relevo = self._relevo()
+        callbacks = []
+        with mock.patch.object(reproductor.diagnostico, "crear_hilo",
+                               side_effect=lambda target, _n: mock.Mock(start=target)), \
+                mock.patch.object(reproductor.wx, "CallAfter",
+                                  side_effect=lambda fn, *a: callbacks.append(lambda: fn(*a))), \
+                mock.patch.object(reproductor.relevo_ffmpeg, "RelevoFfmpeg",
+                                  return_value=relevo):
+            panel._reproducir_calidad(None, reproducir=False)
+            self.assertTrue(panel._cargando)   # Reproducir no debe relanzar yt-dlp
+            callbacks[0]()
+        self.assertFalse(panel._cargando)
+        self.assertIs(panel._relevo_ffmpeg, relevo)
+
+    def test_excepcion_al_abrir_el_medio_detiene_el_relevo(self):
+        panel = self._panel()
+        relevo = self._relevo()
+        panel._inst.media_new.side_effect = RuntimeError("VLC no abre")
+        hilo, callafter = self._sincrono()
+        with hilo, callafter, mock.patch.object(
+                reproductor.relevo_ffmpeg, "RelevoFfmpeg", return_value=relevo):
+            panel._reproducir_calidad(None, reproducir=False)
+        relevo.detener.assert_called_once()
+        self.assertIsNone(panel._relevo_ffmpeg)
+        panel._error_carga.assert_called_once_with()
+
+    def test_error_de_vlc_con_relevo_vivo_reintenta_la_conexion(self):
+        panel = self._panel()
+        panel._relevo_ffmpeg = self._relevo()
+        panel._relevo_reintentos = 0
+        with mock.patch.object(reproductor, "anunciar") as anunciar:
+            panel._fallo_reproduccion()
+        panel._player.play.assert_called_once()
+        panel._detener.assert_not_called()
+        anunciar.assert_not_called()
+        self.assertEqual(panel._relevo_reintentos, 1)
+
+    def test_error_de_vlc_agotados_los_reintentos_para_y_avisa(self):
+        panel = self._panel()
+        panel._relevo_ffmpeg = self._relevo()
+        panel._relevo_reintentos = 3
+        with mock.patch.object(reproductor, "anunciar") as anunciar, \
+                mock.patch("sound_player.reproducir") as sonido:
+            panel._fallo_reproduccion()
+        panel._player.play.assert_not_called()
+        panel._detener.assert_called_once_with(silencioso=True)
+        sonido.assert_called_once_with("error")
+        anunciar.assert_called_once_with("No se pudo reproducir el vídeo")
+
+    def test_error_de_vlc_sin_relevo_para_y_avisa(self):
+        panel = self._panel()
+        with mock.patch.object(reproductor, "anunciar") as anunciar, \
+                mock.patch("sound_player.reproducir"):
+            panel._fallo_reproduccion()
+        panel._detener.assert_called_once_with(silencioso=True)
+        anunciar.assert_called_once_with("No se pudo reproducir el vídeo")
+
+    def test_aviso_de_busqueda_con_relevo_es_el_del_directo(self):
+        panel = self._panel()
+        panel._relevo_ffmpeg = self._relevo()
+        panel._busqueda_permitida_actual = mock.Mock(return_value=False)
+        panel._player.get_length.return_value = 0  # lo que da VLC con el relevo
+        with mock.patch.object(reproductor, "anunciar") as anunciar:
+            panel._buscar_rel(-10_000)
+            panel._buscar_porcentaje(50)
+        self.assertEqual(
+            [c.args[0] for c in anunciar.call_args_list],
+            ["En este directo no se puede adelantar ni retroceder"] * 2)
+        panel._player.set_time.assert_not_called()
+
+
+class TestDirectoInterrumpido(unittest.TestCase):
+    """Cuando ffmpeg termina (fin del directo, URL caducada, corte de red)
+    VLC ve un fin de archivo: no es «Fin del vídeo», es una interrupción
+    que se intenta recuperar recargando."""
+
+    def _panel(self, relevo=None, is_live=True, recargas=0):
+        panel = reproductor.ReproductorPanel.__new__(reproductor.ReproductorPanel)
+        panel._player = mock.Mock()
+        panel._muted = False
+        panel._url_flujo = ""
+        panel._video_id = "vid"
+        panel._info = {"is_live": is_live}
+        panel._relevo_ffmpeg = relevo
+        panel._recargas_directo = recargas
+        panel._estado_inicio = mock.Mock(requiere=False)
+        panel._estado_busqueda = mock.Mock(pendiente=False)
+        panel._orden_transporte = None
+        panel._timer = mock.Mock()
+        panel._estado_vlc_actual = mock.Mock(return_value="ended")
+        panel._evaluar_transporte = mock.Mock()
+        panel._evaluar_busqueda = mock.Mock()
+        panel._detener = mock.Mock()
+        panel._fijar_estado = mock.Mock()
+        panel.cargar = mock.Mock()
+        return panel
+
+    def test_fin_con_relevo_en_directo_avisa_y_recarga_una_vez(self):
+        panel = self._panel(relevo=mock.Mock())
+        with mock.patch.object(reproductor, "anunciar") as anunciar:
+            panel._on_timer(None)
+        panel._detener.assert_called_once_with(silencioso=True)
+        anunciar.assert_called_once_with("El directo se interrumpió")
+        panel.cargar.assert_called_once_with(reproducir=True)
+        self.assertEqual(panel._recargas_directo, 1)
+
+    def test_agotadas_las_recargas_no_vuelve_a_intentar(self):
+        panel = self._panel(relevo=mock.Mock(),
+                            recargas=reproductor.TOPE_RECARGAS_DIRECTO)
+        with mock.patch.object(reproductor, "anunciar") as anunciar:
+            panel._on_timer(None)
+        panel._detener.assert_called_once_with(silencioso=True)
+        anunciar.assert_called_once_with("El directo se interrumpió")
+        panel.cargar.assert_not_called()
+        panel._fijar_estado.assert_called_once_with("El directo se interrumpió.")
+        self.assertEqual(panel._recargas_directo, reproductor.TOPE_RECARGAS_DIRECTO)
+
+    def test_fin_sin_relevo_sigue_siendo_fin_del_video(self):
+        panel = self._panel(relevo=None, is_live=False)
+        with mock.patch.object(reproductor, "anunciar") as anunciar:
+            panel._on_timer(None)
+        panel._detener.assert_called_once_with(silencioso=True)
+        anunciar.assert_called_once_with("Fin del vídeo")
+        panel.cargar.assert_not_called()
+
+    def test_cambiar_de_video_reinicia_el_contador(self):
+        panel = self._panel(relevo=None, recargas=2)
+        panel._listo = True
+        panel._ciclo = None
+        panel._calidad_sel = None
+        panel._alturas = []
+        panel.set_video("otro", autoplay=True)
+        self.assertEqual(panel._recargas_directo, 0)
+        panel.cargar.assert_called_once_with(reproducir=True)
+
+
+class TestAnchoEstado(unittest.TestCase):
+    """Wrap() solo estrecha: hay que partir siempre del texto original."""
+
+    def _panel(self, ancho=500):
+        panel = reproductor.ReproductorPanel.__new__(reproductor.ReproductorPanel)
+        panel.lbl_estado = mock.Mock()
+        panel.GetClientSize = mock.Mock(return_value=mock.Mock(Width=ancho))
+        return panel
+
+    def test_reajustar_parte_del_texto_original(self):
+        panel = self._panel()
+        panel._fijar_estado("Aviso largo de espera")
+        panel.lbl_estado.reset_mock()
+        panel._ajustar_ancho_estado()
+        self.assertEqual(panel.lbl_estado.method_calls, [
+            mock.call.SetLabel("Aviso largo de espera"),
+            mock.call.Wrap(460),
+        ])
+
+    def test_dos_reajustes_seguidos_no_acumulan_saltos(self):
+        panel = self._panel()
+        panel._fijar_estado("Aviso largo de espera")
+        panel._ajustar_ancho_estado()
+        panel._ajustar_ancho_estado()
+        # _fijar_estado fija la etiqueta y reajusta (2 SetLabel); cada reajuste
+        # posterior vuelve a partir del texto original, nunca del ya partido.
+        etiquetas = [c.args[0] for c in panel.lbl_estado.SetLabel.call_args_list]
+        self.assertEqual(etiquetas, ["Aviso largo de espera"] * 4)
+        panel.lbl_estado.GetLabel.assert_not_called()
+
+    def test_sin_texto_guardado_usa_la_etiqueta_actual(self):
+        panel = self._panel()
+        panel.lbl_estado.GetLabel.return_value = "Sin reproducir."
+        panel._ajustar_ancho_estado()
+        panel.lbl_estado.SetLabel.assert_called_once_with("Sin reproducir.")
+
 
 if __name__ == "__main__":
     unittest.main()

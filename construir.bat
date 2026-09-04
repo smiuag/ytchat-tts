@@ -55,6 +55,9 @@ REM --noupx: NO comprimir con UPX. UPX dispara muchos falsos positivos de
 REM antivirus; sin el, el .exe levanta menos sospechas en el PC del amigo.
 REM El modulo da metadatos rapidos y el ejecutable mantiene flujos y descargas.
 REM yt-dlp carga extractores al vuelo, por eso se recopila completo.
+REM --exclude-module imageio_ffmpeg: su hook metia un segundo ffmpeg.exe en
+REM _internal; la app empaquetada usa el que se copia a la raiz mas abajo
+REM (ffmpeg_bin.ruta_ffmpeg lo busca primero), asi que el otro sobraba.
 call uv run pyinstaller main.py ^
   --name YTChatTTS ^
   --onedir --windowed --noconfirm --clean --noupx ^
@@ -66,6 +69,7 @@ call uv run pyinstaller main.py ^
   --collect-submodules pytchat ^
   --collect-all TikTokLive ^
   --collect-all yt_dlp ^
+  --exclude-module imageio_ffmpeg ^
   --hidden-import vlc ^
   --add-data "!YTDOC!;googleapiclient/discovery_cache/documents"
 if errorlevel 1 ( echo ERROR en PyInstaller. & pause & exit /b 1 )
@@ -150,6 +154,8 @@ REM viaja tambien dentro de docs/. La dejamos ademas en la raiz, a la vista. El
 REM historial de versiones (CHANGELOG) va como docs/CHANGELOG.html, enlazado
 REM desde el propio Leeme ("que hay de nuevo").
 copy /y "docs\README.html" "%OUT%\Leeme.html" >nul
+REM Solo en la raiz: sus enlaces (docs/...) se calculan desde ahi y dentro de docs/ quedaban rotos.
+del /q "%OUT%\docs\README.html" >nul 2>&1
 
 REM Por higiene: nada de log ni credenciales en el paquete que se envia.
 del /q "%OUT%\ytchat.log" 2>nul

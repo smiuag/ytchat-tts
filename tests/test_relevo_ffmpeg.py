@@ -1,4 +1,6 @@
+import io
 import socket
+import subprocess
 import unittest
 from unittest import mock
 
@@ -40,15 +42,14 @@ class PruebasCicloDeVida(unittest.TestCase):
 
     def test_iniciar_sin_ffmpeg_devuelve_none(self):
         relevo = relevo_ffmpeg.RelevoFfmpeg("video", "audio")
-        with mock.patch("imageio_ffmpeg.get_ffmpeg_exe",
-                        side_effect=Exception("no hay ffmpeg")):
+        with mock.patch("ffmpeg_bin.ruta_ffmpeg", return_value=None):
             self.assertIsNone(relevo.iniciar())
         self.assertFalse(relevo.activo())
         self.assertIsNone(relevo.direccion)
 
     def test_iniciar_si_popen_falla_devuelve_none(self):
         relevo = relevo_ffmpeg.RelevoFfmpeg("video", "audio")
-        with mock.patch("imageio_ffmpeg.get_ffmpeg_exe", return_value="ffmpeg.exe"), \
+        with mock.patch("ffmpeg_bin.ruta_ffmpeg", return_value="ffmpeg.exe"), \
                 mock.patch("subprocess.Popen", side_effect=OSError("no se pudo")):
             self.assertIsNone(relevo.iniciar())
         self.assertFalse(relevo.activo())
@@ -57,7 +58,7 @@ class PruebasCicloDeVida(unittest.TestCase):
         relevo = relevo_ffmpeg.RelevoFfmpeg("video", "audio")
         proceso = mock.Mock()
         proceso.poll.return_value = None
-        with mock.patch("imageio_ffmpeg.get_ffmpeg_exe", return_value="ffmpeg.exe"), \
+        with mock.patch("ffmpeg_bin.ruta_ffmpeg", return_value="ffmpeg.exe"), \
                 mock.patch("subprocess.Popen", return_value=proceso), \
                 mock.patch.object(relevo_ffmpeg, "puerto_libre", return_value=9999):
             direccion = relevo.iniciar()
@@ -69,7 +70,7 @@ class PruebasCicloDeVida(unittest.TestCase):
         relevo = relevo_ffmpeg.RelevoFfmpeg("video", "audio")
         proceso = mock.Mock()
         proceso.poll.return_value = None
-        with mock.patch("imageio_ffmpeg.get_ffmpeg_exe", return_value="ffmpeg.exe"), \
+        with mock.patch("ffmpeg_bin.ruta_ffmpeg", return_value="ffmpeg.exe"), \
                 mock.patch("subprocess.Popen", return_value=proceso), \
                 mock.patch.object(relevo_ffmpeg, "puerto_libre", return_value=9999):
             relevo.iniciar()
@@ -85,12 +86,164 @@ class PruebasCicloDeVida(unittest.TestCase):
         relevo = relevo_ffmpeg.RelevoFfmpeg("video", "audio")
         proceso = mock.Mock()
         proceso.poll.return_value = None
-        with mock.patch("imageio_ffmpeg.get_ffmpeg_exe", return_value="ffmpeg.exe"), \
+        with mock.patch("ffmpeg_bin.ruta_ffmpeg", return_value="ffmpeg.exe"), \
                 mock.patch("subprocess.Popen", return_value=proceso), \
                 mock.patch.object(relevo_ffmpeg, "puerto_libre", return_value=9999):
             relevo.iniciar()
         proceso.poll.return_value = 1
         self.assertFalse(relevo.activo())
+
+
+class PruebasListener(unittest.TestCase):
+    """La espera al listener sondea el puerto en vez de dormir un tiempo
+    fijo: ffmpeg tarda en abrirlo lo que tarde en sondear las dos HLS."""
+
+    def test_escuchando_detecta_un_listener_real_sin_conectarse(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as servidor:
+            servidor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            servidor.bind(("127.0.0.1", 0))
+            servidor.listen(1)
+            puerto = servidor.getsockname()[1]
+            self.assertTrue(relevo_ffmpeg.escuchando(puerto))
+            servidor.settimeout(0.2)
+            with self.assertRaises(socket.timeout):
+                servidor.accept()  # nadie se conectó: la sonda no consume el cliente
+
+    def test_escuchando_con_puerto_libre_es_falso(self):
+        self.assertFalse(relevo_ffmpeg.escuchando(relevo_ffmpeg.puerto_libre()))
+
+    def test_esperar_listener_sigue_en_cuanto_escucha(self):
+        reloj = iter([0.0, 0.1, 0.2, 0.3])
+        dormidas = []
+        sondas = iter([False, False, True])
+        with mock.patch.object(relevo_ffmpeg, "escuchando",
+                               side_effect=lambda _p: next(sondas)):
+            listo = relevo_ffmpeg.esperar_listener(
+                5000, lambda: True, timeout=10, intervalo=0.1,
+                ahora=lambda: next(reloj), dormir=dormidas.append)
+        self.assertTrue(listo)
+        self.assertEqual(dormidas, [0.1, 0.1])
+
+    def test_esperar_listener_si_ffmpeg_muere_devuelve_falso(self):
+        vivo = iter([True, False])
+        with mock.patch.object(relevo_ffmpeg, "escuchando", return_value=False):
+            listo = relevo_ffmpeg.esperar_listener(
+                5000, lambda: next(vivo), timeout=10, intervalo=0,
+                ahora=lambda: 0.0, dormir=lambda _s: None)
+        self.assertFalse(listo)
+
+    def test_esperar_listener_vence_el_plazo(self):
+        reloj = iter([0.0, 5.0, 21.0])
+        with mock.patch.object(relevo_ffmpeg, "escuchando", return_value=False):
+            listo = relevo_ffmpeg.esperar_listener(
+                5000, lambda: True, timeout=20, intervalo=0,
+                ahora=lambda: next(reloj), dormir=lambda _s: None)
+        self.assertFalse(listo)
+
+    def test_esperar_listo_sin_iniciar_es_falso(self):
+        self.assertFalse(relevo_ffmpeg.RelevoFfmpeg("v", "a").esperar_listo())
+
+    def test_esperar_listo_usa_el_puerto_y_la_vida_del_proceso(self):
+        relevo = relevo_ffmpeg.RelevoFfmpeg("video", "audio")
+        proceso = mock.Mock()
+        proceso.poll.return_value = None
+        with mock.patch("ffmpeg_bin.ruta_ffmpeg", return_value="ffmpeg.exe"), \
+                mock.patch("subprocess.Popen", return_value=proceso), \
+                mock.patch.object(relevo_ffmpeg, "puerto_libre", return_value=9999):
+            relevo.iniciar()
+        with mock.patch.object(relevo_ffmpeg, "esperar_listener",
+                               return_value=True) as esperar:
+            self.assertTrue(relevo.esperar_listo(timeout=3))
+        esperar.assert_called_once_with(9999, relevo.activo, 3)
+        relevo.detener()
+
+
+class PruebasStderr(unittest.TestCase):
+    """Lo que ffmpeg escribe por stderr (403, «Invalid data found») va al
+    registro; antes iba a DEVNULL y el fallo del relevo no dejaba rastro."""
+
+    def _sincrono(self):
+        return mock.patch.object(
+            relevo_ffmpeg.diagnostico, "crear_hilo",
+            side_effect=lambda target, _n, args=(): mock.Mock(
+                start=lambda: target(*args)))
+
+    def test_iniciar_pide_stderr_por_tuberia(self):
+        relevo = relevo_ffmpeg.RelevoFfmpeg("video", "audio")
+        proceso = mock.Mock()
+        proceso.poll.return_value = None
+        with mock.patch("ffmpeg_bin.ruta_ffmpeg", return_value="ffmpeg.exe"), \
+                mock.patch("subprocess.Popen", return_value=proceso) as popen, \
+                mock.patch.object(relevo_ffmpeg, "puerto_libre", return_value=9999):
+            relevo.iniciar()
+        self.assertEqual(popen.call_args.kwargs["stderr"], subprocess.PIPE)
+        relevo.detener()
+
+    def test_cada_linea_de_stderr_queda_en_el_registro(self):
+        relevo = relevo_ffmpeg.RelevoFfmpeg("video", "audio")
+        proceso = mock.Mock()
+        proceso.poll.return_value = None
+        proceso.pid = 4242
+        proceso.stderr = io.BytesIO(
+            b"HTTP error 403 Forbidden\nInvalid data found when processing input\n")
+        with mock.patch("ffmpeg_bin.ruta_ffmpeg", return_value="ffmpeg.exe"), \
+                mock.patch("subprocess.Popen", return_value=proceso), \
+                mock.patch.object(relevo_ffmpeg, "puerto_libre", return_value=9999), \
+                self._sincrono(), \
+                self.assertLogs(relevo_ffmpeg.logger, level="WARNING") as registro:
+            relevo.iniciar()
+        self.assertEqual(len(registro.records), 2)
+        self.assertIn("403 Forbidden", registro.output[0])
+        self.assertIn("pid=4242", registro.output[0])
+        self.assertIn("Invalid data found", registro.output[1])
+        self.assertTrue(proceso.stderr.closed)
+        relevo.detener()
+
+    def test_stderr_que_no_es_un_flujo_se_ignora_sin_colgarse(self):
+        # Las pruebas del ciclo de vida dan un Mock como proceso: leer de su
+        # stderr (otro Mock) no terminaría nunca.
+        for flujo in (None, mock.Mock(), object()):
+            relevo_ffmpeg.volcar_stderr(flujo, 1)
+
+    def test_detener_no_espera_al_lector(self):
+        relevo = relevo_ffmpeg.RelevoFfmpeg("video", "audio")
+        proceso = mock.Mock()
+        proceso.poll.return_value = None
+        proceso.stderr = io.BytesIO(b"")
+        with mock.patch("ffmpeg_bin.ruta_ffmpeg", return_value="ffmpeg.exe"), \
+                mock.patch("subprocess.Popen", return_value=proceso), \
+                mock.patch.object(relevo_ffmpeg, "puerto_libre", return_value=9999):
+            relevo.iniciar()
+        relevo.detener()
+        proceso.kill.assert_called_once()
+        proceso.wait.assert_called_once_with(timeout=5)
+
+
+class PruebasRelevosVivos(unittest.TestCase):
+    """Un relevo iniciado queda registrado para matarlo al salir de la app
+    aunque nadie llegue a llamar a detener() (cierre durante la preparación)."""
+
+    def _iniciado(self):
+        relevo = relevo_ffmpeg.RelevoFfmpeg("video", "audio")
+        proceso = mock.Mock()
+        proceso.poll.return_value = None
+        with mock.patch("ffmpeg_bin.ruta_ffmpeg", return_value="ffmpeg.exe"), \
+                mock.patch("subprocess.Popen", return_value=proceso), \
+                mock.patch.object(relevo_ffmpeg, "puerto_libre", return_value=9999):
+            relevo.iniciar()
+        return relevo, proceso
+
+    def test_iniciar_registra_y_detener_desregistra(self):
+        relevo, _ = self._iniciado()
+        self.assertIn(relevo, relevo_ffmpeg._VIVOS)
+        relevo.detener()
+        self.assertNotIn(relevo, relevo_ffmpeg._VIVOS)
+
+    def test_detener_todos_mata_los_que_quedaban(self):
+        relevo, proceso = self._iniciado()
+        relevo_ffmpeg.detener_todos()
+        proceso.kill.assert_called_once()
+        self.assertNotIn(relevo, relevo_ffmpeg._VIVOS)
 
 
 if __name__ == "__main__":

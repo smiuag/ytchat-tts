@@ -14,6 +14,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import diagnostico
+import ffmpeg_bin
 from esclavo_audio import TAMANIO_MINIMO
 from progreso_ytdlp import PLANTILLA, analizar_linea_progreso
 
@@ -79,11 +80,26 @@ def _ruta_del_paquete() -> Path | None:
 
 
 def ruta_ytdlp() -> str | None:
-    """Devuelve la copia actualizada o la que viaja junto al ejecutable."""
-    for ruta in (_ruta_actualizada(), _ruta_del_paquete()):
-        if ruta is not None and ruta.is_file():
-            return str(ruta)
-    return None
+    """Devuelve la copia más reciente entre la actualizada (LOCALAPPDATA) y
+    la que viaja junto al ejecutable.
+
+    Gana la de fecha de modificación más nueva: si el usuario instala un
+    paquete nuevo, su yt-dlp puede ser posterior a la copia que actualizó
+    hace meses, y antes esa copia vieja ganaba siempre. A igual fecha se
+    mantiene la actualizada.
+    """
+    candidatas = [ruta for ruta in (_ruta_actualizada(), _ruta_del_paquete())
+                  if ruta is not None and ruta.is_file()]
+    if not candidatas:
+        return None
+
+    def fecha(ruta: Path) -> float:
+        try:
+            return ruta.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    return str(max(candidatas, key=fecha))
 
 
 def version_ytdlp(ruta: str | os.PathLike) -> str:
@@ -234,8 +250,9 @@ def _argumentos_video_cache(ruta: str | os.PathLike, temporal: Path, video_id: s
         "--no-warnings", "--limit-rate", LIMITE_CACHE,
         "--merge-output-format", "mp4",
     ]
-    if getattr(sys, "frozen", False):
-        argumentos.extend(["--ffmpeg-location", str(Path(sys.executable).parent)])
+    ffmpeg = ffmpeg_bin.ruta_ffmpeg()
+    if ffmpeg:
+        argumentos.extend(["--ffmpeg-location", ffmpeg])
     argumentos.append(f"https://www.youtube.com/watch?v={video_id}")
     return argumentos
 
@@ -274,11 +291,16 @@ def descargar_video_cache(video_id: str, destino: Path, cancel_event=None,
         return False
     finally:
         if temporal is not None:
-            try:
-                if temporal.exists():
-                    temporal.unlink()
-            except OSError:
-                pass
+            # Además del temporal, lo que yt-dlp deja a medias al cancelar o
+            # fallar: «.ytcache-x.mp4.part», «.ytcache-x.f137.mp4»… Todos
+            # comparten el tallo único del temporal, así que el glob no
+            # alcanza a otra descarga.
+            for resto in [temporal, *temporal.parent.glob(temporal.stem + "*")]:
+                try:
+                    if resto.exists():
+                        resto.unlink()
+                except OSError:
+                    pass
 
 
 def ultima_version_ytdlp() -> tuple[str, str, str] | None:

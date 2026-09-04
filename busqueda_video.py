@@ -66,7 +66,11 @@ def busqueda_permitida(es_directo, es_local, tiene_esclavo, usa_relevo=False) ->
 def destino_acumulado(destino_pendiente, posicion_actual, delta_ms,
                       duracion_ms) -> int:
     base = posicion_actual if destino_pendiente is None else destino_pendiente
-    destino = min(max(0, base + delta_ms), duracion_ms)
+    # VLC puede dar una duración menor que la posición real (directos: se
+    # vio pos=7737861 con dur=900000). Recortar por esa duración convertía
+    # un retroceso de 1 min en uno de casi 2 h: el tope nunca baja de la base.
+    tope = max(duracion_ms, base)
+    destino = min(max(0, base + delta_ms), tope)
     if delta_ms > 0 and destino < base:
         return base
     return destino

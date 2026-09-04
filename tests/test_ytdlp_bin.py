@@ -1,4 +1,5 @@
 import hashlib
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -247,6 +248,34 @@ class PruebasYtdlpBin(unittest.TestCase):
             paquete = Path(carpeta) / "paquete.exe"
             actualizada.touch()
             paquete.touch()
+            os.utime(paquete, (1_000_000, 1_000_000))
+            os.utime(actualizada, (2_000_000, 2_000_000))
+            with patch.object(ytdlp_bin, "_ruta_actualizada", return_value=actualizada), \
+                    patch.object(ytdlp_bin, "_ruta_del_paquete", return_value=paquete):
+                self.assertEqual(str(actualizada), ytdlp_bin.ruta_ytdlp())
+
+    def test_busqueda_prefiere_el_paquete_si_es_mas_reciente(self):
+        # Paquete nuevo con un yt-dlp posterior a la copia que el usuario
+        # actualizó hace meses: antes ganaba siempre la copia vieja.
+        with tempfile.TemporaryDirectory() as carpeta:
+            actualizada = Path(carpeta) / "actualizada.exe"
+            paquete = Path(carpeta) / "paquete.exe"
+            actualizada.touch()
+            paquete.touch()
+            os.utime(actualizada, (1_000_000, 1_000_000))
+            os.utime(paquete, (2_000_000, 2_000_000))
+            with patch.object(ytdlp_bin, "_ruta_actualizada", return_value=actualizada), \
+                    patch.object(ytdlp_bin, "_ruta_del_paquete", return_value=paquete):
+                self.assertEqual(str(paquete), ytdlp_bin.ruta_ytdlp())
+
+    def test_busqueda_a_igual_fecha_mantiene_la_actualizada(self):
+        with tempfile.TemporaryDirectory() as carpeta:
+            actualizada = Path(carpeta) / "actualizada.exe"
+            paquete = Path(carpeta) / "paquete.exe"
+            actualizada.touch()
+            paquete.touch()
+            os.utime(actualizada, (1_000_000, 1_000_000))
+            os.utime(paquete, (1_000_000, 1_000_000))
             with patch.object(ytdlp_bin, "_ruta_actualizada", return_value=actualizada), \
                     patch.object(ytdlp_bin, "_ruta_del_paquete", return_value=paquete):
                 self.assertEqual(str(actualizada), ytdlp_bin.ruta_ytdlp())
@@ -463,18 +492,42 @@ class PruebasDescargarVideoCache(unittest.TestCase):
             # No reutilizar .part compartido
             self.assertNotIn(str(Path(carpeta) / "destino.mp4.part"), args)
 
-    def test_argumentos_con_ffmpeg_location_en_frozen(self):
+    def test_argumentos_usan_el_resolvedor_unico_de_ffmpeg(self):
         with tempfile.TemporaryDirectory() as carpeta:
             temporal = Path(carpeta) / ".ytcache-x.mp4"
-            with patch.object(sys, "executable", str(Path(carpeta) / "app.exe")), \
-                    patch.object(sys, "frozen", True, create=True):
+            with patch.object(ytdlp_bin.ffmpeg_bin, "ruta_ffmpeg",
+                              return_value=r"C:\app\ffmpeg.exe"):
                 args = ytdlp_bin._argumentos_video_cache("yt-dlp.exe", temporal, "A" * 11)
-                self.assertIn("--ffmpeg-location", args)
                 idx = args.index("--ffmpeg-location")
-                self.assertEqual(str(Path(sys.executable).parent), args[idx + 1])
-            with patch.object(sys, "frozen", False, create=True):
+                self.assertEqual(r"C:\app\ffmpeg.exe", args[idx + 1])
+            with patch.object(ytdlp_bin.ffmpeg_bin, "ruta_ffmpeg", return_value=None):
                 args2 = ytdlp_bin._argumentos_video_cache("yt-dlp.exe", temporal, "A" * 11)
                 self.assertNotIn("--ffmpeg-location", args2)
+
+    def test_cancelado_borra_tambien_fragmentos_y_part_del_temporal(self):
+        # yt-dlp deja «.part», «.ytdl» y fragmentos «.fNNN.ext» junto al
+        # temporal; solo borrar el temporal los dejaba huérfanos en la caché.
+        with tempfile.TemporaryDirectory() as carpeta:
+            destino = Path(carpeta) / "salida.mp4"
+            destino.write_bytes(b"previo")
+            ajeno = Path(carpeta) / ".ytcache-otro.mp4.part"
+            ajeno.write_bytes(b"de otra descarga")
+
+            def falso_ejecutar(argumentos, cancel_event=None, tope_segundos=3600, **kw):
+                temporal = Path(argumentos[argumentos.index("-o") + 1])
+                temporal.with_name(temporal.name + ".part").write_bytes(b"a medias")
+                temporal.with_name(temporal.name + ".ytdl").write_bytes(b"{}")
+                temporal.with_name(temporal.stem + ".f137.mp4").write_bytes(b"video")
+                return subprocesos.Estado.cancelado
+
+            with patch.object(ytdlp_bin, "ruta_ytdlp", return_value="yt-dlp.exe"), \
+                    patch.object(subprocesos, "ejecutar", side_effect=falso_ejecutar):
+                resultado = ytdlp_bin.descargar_video_cache("A" * 11, destino,
+                                                            cancel_event=threading.Event())
+            self.assertFalse(resultado)
+            self.assertEqual(b"previo", destino.read_bytes())
+            self.assertEqual({"salida.mp4", ".ytcache-otro.mp4.part"},
+                             {ruta.name for ruta in Path(carpeta).iterdir()})
 
     def test_descargar_video_cache_usa_temporal_unico_en_parent(self):
         with tempfile.TemporaryDirectory() as carpeta:
