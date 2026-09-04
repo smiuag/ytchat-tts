@@ -63,6 +63,45 @@ def busqueda_permitida(es_directo, es_local, tiene_esclavo, usa_relevo=False) ->
     return True
 
 
+# Búsqueda en un directo por el relevo de ffmpeg (ver relevo_ffmpeg.py).
+# VLC no puede moverse por ese flujo, así que «retroceder» es reiniciar
+# ffmpeg unos segmentos antes del borde del directo. La posición se lleva
+# como segmentos por detrás del borde (0 = en el directo). Los últimos
+# segmentos de la ventana HLS caducan mientras se arranca: se dejan de margen.
+MARGEN_VENTANA_SEGMENTOS = 12
+VENTANA_HLS_SUPUESTA = (5.0, 60)   # (s por segmento, segmentos) si no se pudo leer
+
+
+def desfase_tras_salto(desfase_seg, delta_ms, segmento_ms, ventana_seg) -> int:
+    """Segmentos por detrás del directo tras un salto relativo.
+
+    delta_ms negativo retrocede (aleja del borde); positivo adelanta (acerca).
+    Un salto menor que un segmento mueve un segmento: pulsar siempre hace algo
+    o, si no puede, el llamador lo anuncia porque el valor no cambió.
+    """
+    desfase_seg = max(0, int(desfase_seg or 0))
+    if not segmento_ms or segmento_ms <= 0 or not delta_ms:
+        return desfase_seg
+    pasos = max(1, round(abs(delta_ms) / float(segmento_ms)))
+    nuevo = desfase_seg + pasos if delta_ms < 0 else desfase_seg - pasos
+    tope = max(0, int(ventana_seg or 0) - MARGEN_VENTANA_SEGMENTOS)
+    return max(0, min(nuevo, tope))
+
+
+def frase_desfase_directo(segundos) -> str:
+    """«En el directo», «1 minuto por detrás del directo»…"""
+    s = max(0, int(round(segundos or 0)))
+    if s == 0:
+        return "En el directo"
+    m, sec = divmod(s, 60)
+    partes = []
+    if m:
+        partes.append(f"{m} minuto" + ("s" if m != 1 else ""))
+    if sec:
+        partes.append(f"{sec} segundo" + ("s" if sec != 1 else ""))
+    return " y ".join(partes) + " por detrás del directo"
+
+
 def destino_acumulado(destino_pendiente, posicion_actual, delta_ms,
                       duracion_ms) -> int:
     base = posicion_actual if destino_pendiente is None else destino_pendiente

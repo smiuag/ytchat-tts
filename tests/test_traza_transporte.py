@@ -149,6 +149,18 @@ class TestTopologia(unittest.TestCase):
         for fragmento in ("googlevideo", "ytimg", "m3u8", "signature", "sig="):
             self.assertNotIn(fragmento, linea2.lower())
 
+    def test_traza_salto_rechazado(self):
+        from traza_transporte import traza_salto_rechazado
+        linea = traza_salto_rechazado("relevo", "deslizador", "relevo_sin_barra")
+        self.assertEqual(
+            linea, "SALTO_RECHAZADO topologia=relevo origen=deslizador motivo=relevo_sin_barra")
+
+    def test_traza_salto_relevo(self):
+        from traza_transporte import traza_salto_relevo
+        linea = traza_salto_relevo(-60_000, 0, 12, 5000.0, 720)
+        self.assertEqual(
+            linea, "SALTO_RELEVO delta=-60000 desfase=0->12 segmento_ms=5000 ventana=720")
+
 
 if __name__ == "__main__":
     unittest.main()

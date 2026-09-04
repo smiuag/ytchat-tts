@@ -6,11 +6,51 @@ from unittest import mock
 from types import SimpleNamespace
 
 from busqueda_video import (
-    CADUCIDAD_DESTINO_MS, EstadoBusqueda, PROGRESO_MINIMO_MS,
-    TOLERANCIA_ATRAS_MS, TOLERANCIA_DESTINO_MS, TOPE_BUSQUEDA_MS,
-    accion_play_pausa, destino_acumulado, destino_alcanzado, destino_vigente,
+    CADUCIDAD_DESTINO_MS, EstadoBusqueda, MARGEN_VENTANA_SEGMENTOS,
+    PROGRESO_MINIMO_MS, TOLERANCIA_ATRAS_MS, TOLERANCIA_DESTINO_MS,
+    TOPE_BUSQUEDA_MS, accion_play_pausa, desfase_tras_salto, destino_acumulado,
+    destino_alcanzado, destino_vigente, frase_desfase_directo,
     posicion_a_mostrar, posicion_confiable, transporte_confirmado,
 )
+
+
+class TestDesfaseRelevo(unittest.TestCase):
+    """Salto en directo por relevo: se cuenta en segmentos por detrás del borde."""
+
+    def test_retroceder_un_minuto_son_doce_segmentos_de_cinco(self):
+        self.assertEqual(desfase_tras_salto(0, -60_000, 5_000, 720), 12)
+
+    def test_adelantar_acerca_al_borde_sin_pasarse(self):
+        self.assertEqual(desfase_tras_salto(12, 60_000, 5_000, 720), 0)
+        self.assertEqual(desfase_tras_salto(2, 60_000, 5_000, 720), 0)
+
+    def test_en_el_borde_adelantar_no_cambia_nada(self):
+        self.assertEqual(desfase_tras_salto(0, 10_000, 5_000, 720), 0)
+
+    def test_un_salto_menor_que_un_segmento_mueve_un_segmento(self):
+        self.assertEqual(desfase_tras_salto(0, -1_000, 5_000, 720), 1)
+
+    def test_no_pasa_del_final_de_la_ventana_menos_el_margen(self):
+        tope = 720 - MARGEN_VENTANA_SEGMENTOS
+        self.assertEqual(desfase_tras_salto(700, -600_000, 5_000, 720), tope)
+        self.assertEqual(desfase_tras_salto(tope, -60_000, 5_000, 720), tope)
+
+    def test_ventana_corta_deja_retroceder_lo_que_hay(self):
+        self.assertEqual(desfase_tras_salto(0, -60_000, 5_000, 20), 8)
+        self.assertEqual(desfase_tras_salto(0, -60_000, 5_000, 5), 0)
+
+    def test_sin_segmento_o_sin_delta_no_cambia(self):
+        self.assertEqual(desfase_tras_salto(3, -60_000, 0, 720), 3)
+        self.assertEqual(desfase_tras_salto(3, 0, 5_000, 720), 3)
+
+    def test_frase_del_desfase(self):
+        self.assertEqual(frase_desfase_directo(0), "En el directo")
+        self.assertEqual(frase_desfase_directo(60), "1 minuto por detrás del directo")
+        self.assertEqual(frase_desfase_directo(10), "10 segundos por detrás del directo")
+        self.assertEqual(frase_desfase_directo(125),
+                         "2 minutos y 5 segundos por detrás del directo")
+        self.assertEqual(frase_desfase_directo(61),
+                         "1 minuto y 1 segundo por detrás del directo")
 
 
 class TestDestinoAcumulado(unittest.TestCase):

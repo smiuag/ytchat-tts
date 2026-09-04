@@ -117,17 +117,75 @@ def volcar_stderr(flujo, pid) -> None:
             pass
 
 
+# Segmentos que ffmpeg deja por detrás del borde al abrir un HLS en vivo
+# (su live_start_index por defecto es -3). Un desfase de K segmentos se pide
+# como -(K+3) para que «0» siga siendo exactamente el arranque de siempre.
+SEGMENTOS_BORDE = 3
+
+
 def argumentos_relevo(ffmpeg_exe: str, video_url: str, audio_url: str,
-                      puerto: int) -> list[str]:
+                      puerto: int, desfase_segmentos: int = 0) -> list[str]:
     """Comando de ffmpeg: copia (sin recodificar) vídeo y audio a un único
-    mpegts, escuchando en localhost para que VLC se conecte como cliente."""
+    mpegts, escuchando en localhost para que VLC se conecte como cliente.
+
+    Con desfase, las dos entradas arrancan el mismo número de segmentos por
+    detrás del borde. Las listas de vídeo y audio de YouTube comparten la
+    numeración y la duración de segmento (comprobado con un directo real:
+    5 s, misma MEDIA-SEQUENCE), así que empezar ambas en el mismo índice las
+    deja alineadas y ffmpeg, que pone a cero el inicio de cada entrada por
+    separado, no las desincroniza.
+    """
+    entrada = []
+    if desfase_segmentos and desfase_segmentos > 0:
+        entrada = ["-live_start_index",
+                   str(-(int(desfase_segmentos) + SEGMENTOS_BORDE))]
     return [
         ffmpeg_exe, "-loglevel", "warning", "-nostdin",
-        "-i", video_url, "-i", audio_url,
+        *entrada, "-i", video_url, *entrada, "-i", audio_url,
         "-map", "0:v:0", "-map", "1:a:0",
         "-c", "copy", "-f", "mpegts", "-listen", "1",
         direccion_relevo(puerto),
     ]
+
+
+def ventana_hls(texto: str) -> tuple[float, int] | None:
+    """(segundos por segmento, segmentos en la lista) de una lista HLS, o
+    None si el texto no es una lista de medios."""
+    duracion = None
+    segmentos = 0
+    for linea in texto.splitlines():
+        linea = linea.strip()
+        if linea.startswith("#EXT-X-TARGETDURATION:"):
+            try:
+                duracion = float(linea.split(":", 1)[1])
+            except ValueError:
+                pass
+        elif linea.startswith("#EXTINF:"):
+            segmentos += 1
+    if duracion is None or duracion <= 0 or segmentos == 0:
+        return None
+    return duracion, segmentos
+
+
+def leer_ventana_hls(url: str, timeout: float = 8.0) -> tuple[float, int] | None:
+    """Descarga la lista HLS y devuelve su ventana, o None si no se pudo.
+
+    Sirve para saber cuánto se puede retroceder en un directo (YouTube deja
+    una hora de segmentos de 5 s) sin tener que suponerlo.
+    """
+    import urllib.request
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as respuesta:
+            texto = respuesta.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        logger.warning("No se pudo leer la ventana HLS del directo: %s", exc)
+        return None
+    ventana = ventana_hls(texto)
+    if ventana is None:
+        logger.warning("La lista HLS del directo no trae segmentos legibles")
+    else:
+        logger.debug("VENTANA_HLS segmento_s=%.1f segmentos=%d", *ventana)
+    return ventana
 
 
 class RelevoFfmpeg:
@@ -137,15 +195,20 @@ class RelevoFfmpeg:
     argumentos_relevo/puerto_libre/direccion_relevo, ya probadas aparte.
     """
 
-    def __init__(self, video_url: str, audio_url: str):
+    def __init__(self, video_url: str, audio_url: str, desfase_segmentos: int = 0):
         self._video_url = video_url
         self._audio_url = audio_url
+        self._desfase_segmentos = max(0, int(desfase_segmentos or 0))
         self._proceso: subprocess.Popen | None = None
         self._puerto: int | None = None
 
     @property
     def direccion(self) -> str | None:
         return direccion_relevo(self._puerto) if self._puerto is not None else None
+
+    @property
+    def desfase_segmentos(self) -> int:
+        return self._desfase_segmentos
 
     def iniciar(self) -> str | None:
         """Arranca ffmpeg y devuelve la dirección a la que VLC debe
@@ -157,7 +220,8 @@ class RelevoFfmpeg:
             return None
         puerto = puerto_libre()
         argumentos = argumentos_relevo(
-            ffmpeg_exe, self._video_url, self._audio_url, puerto)
+            ffmpeg_exe, self._video_url, self._audio_url, puerto,
+            self._desfase_segmentos)
         try:
             self._proceso = subprocess.Popen(
                 argumentos, stdin=subprocess.DEVNULL,
@@ -169,8 +233,8 @@ class RelevoFfmpeg:
             return None
         self._puerto = puerto
         _VIVOS.add(self)
-        logger.debug("RELEVO_FFMPEG iniciado puerto=%d pid=%s",
-                     puerto, self._proceso.pid)
+        logger.debug("RELEVO_FFMPEG iniciado puerto=%d pid=%s desfase_seg=%d",
+                     puerto, self._proceso.pid, self._desfase_segmentos)
         # Hilo daemon: termina solo al cerrarse la tubería cuando ffmpeg
         # muere o detener() lo mata, así detener() no tiene que esperarlo.
         diagnostico.crear_hilo(

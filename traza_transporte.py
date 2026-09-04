@@ -34,6 +34,20 @@ def traza_sin_barra(origen, duracion) -> str:
     return f"SALTO_SIN_BARRA origen={origen} dur={duracion}"
 
 
+def traza_salto_rechazado(topologia, origen, motivo) -> str:
+    """Traza de un salto que no se manda a nadie. Antes no quedaba escrito y
+    un «no me van los botones» no se podía distinguir de un botón roto."""
+    return f"SALTO_RECHAZADO topologia={topologia} origen={origen} motivo={motivo}"
+
+
+def traza_salto_relevo(delta_ms, desfase_antes, desfase_despues, segmento_ms,
+                       ventana_seg) -> str:
+    """Traza de un salto en directo por relevo: se reinicia ffmpeg con otro
+    desfase (en segmentos) respecto al borde del directo."""
+    return (f"SALTO_RELEVO delta={delta_ms} desfase={desfase_antes}->{desfase_despues} "
+            f"segmento_ms={int(segmento_ms)} ventana={ventana_seg}")
+
+
 def topologia_medio(es_local=False, tiene_esclavo=False, es_flujo=False,
                     usa_relevo=False) -> str:
     """Etiqueta de topología sin datos sensibles."""

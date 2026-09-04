@@ -94,6 +94,61 @@ class PruebasCicloDeVida(unittest.TestCase):
         self.assertFalse(relevo.activo())
 
 
+class PruebasDesfase(unittest.TestCase):
+    """Reiniciar ffmpeg unos segmentos antes del borde para poder retroceder."""
+
+    def test_sin_desfase_el_comando_no_cambia(self):
+        con = relevo_ffmpeg.argumentos_relevo("f", "v", "a", 5000, 0)
+        sin = relevo_ffmpeg.argumentos_relevo("f", "v", "a", 5000)
+        self.assertEqual(con, sin)
+        self.assertNotIn("-live_start_index", con)
+
+    def test_con_desfase_las_dos_entradas_arrancan_en_el_mismo_indice(self):
+        argumentos = relevo_ffmpeg.argumentos_relevo("f", "v", "a", 5000, 12)
+        esperado = str(-(12 + relevo_ffmpeg.SEGMENTOS_BORDE))
+        self.assertEqual(argumentos[4:10], [
+            "-live_start_index", esperado, "-i", "v",
+            "-live_start_index", esperado])
+        self.assertEqual(argumentos[10:12], ["-i", "a"])
+
+    def test_relevo_pasa_su_desfase_al_comando(self):
+        relevo = relevo_ffmpeg.RelevoFfmpeg("video", "audio", desfase_segmentos=7)
+        self.assertEqual(relevo.desfase_segmentos, 7)
+        proceso = mock.Mock()
+        proceso.poll.return_value = None
+        with mock.patch.object(relevo_ffmpeg.ffmpeg_bin, "ruta_ffmpeg",
+                               return_value="ffmpeg.exe"), \
+                mock.patch("subprocess.Popen", return_value=proceso) as popen, \
+                mock.patch.object(relevo_ffmpeg, "puerto_libre", return_value=9999):
+            relevo.iniciar()
+        argumentos = popen.call_args.args[0]
+        self.assertEqual(argumentos.count("-live_start_index"), 2)
+        self.assertIn(str(-(7 + relevo_ffmpeg.SEGMENTOS_BORDE)), argumentos)
+        relevo.detener()
+
+    def test_ventana_hls_lee_duracion_y_cuenta_segmentos(self):
+        lista = ("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:5\n"
+                 "#EXT-X-MEDIA-SEQUENCE:2460\n"
+                 "#EXTINF:5.000,\nseg1.ts\n#EXTINF:5.000,\nseg2.ts\n#EXTINF:4.980,\nseg3.ts\n")
+        self.assertEqual(relevo_ffmpeg.ventana_hls(lista), (5.0, 3))
+
+    def test_ventana_hls_sin_segmentos_o_sin_duracion_es_none(self):
+        self.assertIsNone(relevo_ffmpeg.ventana_hls("#EXTM3U\n#EXT-X-TARGETDURATION:5\n"))
+        self.assertIsNone(relevo_ffmpeg.ventana_hls("#EXTM3U\n#EXTINF:5.0,\nseg.ts\n"))
+        self.assertIsNone(relevo_ffmpeg.ventana_hls("no es una lista"))
+
+    def test_leer_ventana_hls_tolera_fallos_de_red(self):
+        with mock.patch("urllib.request.urlopen", side_effect=OSError("sin red")):
+            self.assertIsNone(relevo_ffmpeg.leer_ventana_hls("https://x/lista.m3u8"))
+
+    def test_leer_ventana_hls_devuelve_la_ventana(self):
+        respuesta = mock.MagicMock()
+        respuesta.__enter__.return_value.read.return_value = (
+            b"#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXTINF:5.0,\na.ts\n#EXTINF:5.0,\nb.ts\n")
+        with mock.patch("urllib.request.urlopen", return_value=respuesta):
+            self.assertEqual(relevo_ffmpeg.leer_ventana_hls("https://x/lista.m3u8"), (5.0, 2))
+
+
 class PruebasListener(unittest.TestCase):
     """La espera al listener sondea el puerto en vez de dormir un tiempo
     fijo: ffmpeg tarda en abrirlo lo que tarde en sondear las dos HLS."""

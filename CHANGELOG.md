@@ -14,6 +14,14 @@ descargas y la ventana de Preferencias.
   antes con ffmpeg en un único flujo. Si ffmpeg tarda en arrancar, el
   reproductor espera a que esté listo en vez de fallar en silencio; si el
   directo se corta, lo dice y vuelve a conectar solo (hasta dos veces).
+- **Retroceder y adelantar funcionan en los directos que van por ffmpeg.** Los
+  botones de un minuto y las flechas de diez segundos no hacían nada, porque
+  el reproductor no puede moverse por ese flujo. Ahora cada salto reinicia la
+  unión de vídeo y audio unos segundos antes del borde del directo, con un
+  corte de dos o tres segundos, y se anuncia dónde queda uno: «1 minuto por
+  detrás del directo», «En el directo». Se puede retroceder hasta una hora,
+  que es lo que YouTube guarda. Mover el deslizador o pedir un porcentaje
+  sigue sin estar disponible en estos directos, y la app lo dice.
 - **Retroceder en un directo ya no salta dos horas atrás.** El reproductor se
   fiaba de una duración falsa que daba VLC y un retroceso de un minuto acababa
   al principio de la ventana del directo.

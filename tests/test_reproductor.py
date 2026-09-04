@@ -237,6 +237,13 @@ class TestFuentesParaDirecto(unittest.TestCase):
 
 class TestReproducirDirecto(unittest.TestCase):
 
+    def setUp(self):
+        # El relevo lee la ventana HLS por red al arrancar: aquí no hay red.
+        parche = mock.patch.object(reproductor.relevo_ffmpeg, "leer_ventana_hls",
+                                   return_value=None)
+        parche.start()
+        self.addCleanup(parche.stop)
+
     def _panel(self, info):
         panel = reproductor.ReproductorPanel.__new__(reproductor.ReproductorPanel)
         panel._info = info
@@ -290,7 +297,7 @@ class TestReproducirDirecto(unittest.TestCase):
                 mock.patch.object(reproductor.time, "sleep"):
             panel._reproducir_calidad(None, reproducir=False)
 
-        clase_relevo.assert_called_once_with("video-solicitado", "audio-solicitado")
+        clase_relevo.assert_called_once_with("video-solicitado", "audio-solicitado", 0)
         panel._inst.media_new.assert_called_once_with("tcp://127.0.0.1:5555")
         opciones = [c.args[0] for c in medio.add_option.call_args_list]
         self.assertFalse(any(o.startswith(":input-slave=") for o in opciones))
@@ -835,6 +842,12 @@ class TestRelevoRobustez(unittest.TestCase):
         {"vcodec": "none", "acodec": "mp4a", "url": "audio-solicitado"},
     ]}
 
+    def setUp(self):
+        parche = mock.patch.object(reproductor.relevo_ffmpeg, "leer_ventana_hls",
+                                   return_value=None)
+        parche.start()
+        self.addCleanup(parche.stop)
+
     def _panel(self):
         panel = reproductor.ReproductorPanel.__new__(reproductor.ReproductorPanel)
         panel._info = dict(self.INFO)
@@ -956,18 +969,192 @@ class TestRelevoRobustez(unittest.TestCase):
         panel._detener.assert_called_once_with(silencioso=True)
         anunciar.assert_called_once_with("No se pudo reproducir el vídeo")
 
-    def test_aviso_de_busqueda_con_relevo_es_el_del_directo(self):
+    def test_porcentaje_y_deslizador_con_relevo_remiten_a_los_botones(self):
         panel = self._panel()
         panel._relevo_ffmpeg = self._relevo()
         panel._busqueda_permitida_actual = mock.Mock(return_value=False)
         panel._player.get_length.return_value = 0  # lo que da VLC con el relevo
-        with mock.patch.object(reproductor, "anunciar") as anunciar:
-            panel._buscar_rel(-10_000)
+        panel.sld_pos = mock.Mock()
+        with mock.patch.object(reproductor, "anunciar") as anunciar, \
+                mock.patch.object(reproductor.logger, "debug") as debug:
             panel._buscar_porcentaje(50)
+            panel._on_sld_pos(None)
         self.assertEqual(
             [c.args[0] for c in anunciar.call_args_list],
-            ["En este directo no se puede adelantar ni retroceder"] * 2)
+            ["En este directo solo se puede retroceder o adelantar con los "
+             "botones o las flechas"] * 2)
         panel._player.set_time.assert_not_called()
+        trazas = [str(c.args[1]) for c in debug.call_args_list]
+        self.assertTrue(any(t.startswith("SALTO_RECHAZADO") and "porcentaje" in t
+                            for t in trazas))
+        self.assertTrue(any("deslizador" in t for t in trazas if t.startswith("SALTO_RECHAZADO")))
+
+
+class TestSaltoEnRelevo(unittest.TestCase):
+    """Retroceder/adelantar en un directo por relevo reinicia ffmpeg con
+    desfase respecto al borde del directo (VLC no puede moverse solo)."""
+
+    def _panel(self, desfase=0, ventana=(5.0, 720)):
+        panel = TestRelevoRobustez._panel(TestRelevoRobustez())
+        panel._relevo_ffmpeg = self._relevo()
+        panel._relevo_fuentes = ("video-hls", "audio-hls")
+        panel._relevo_desfase = desfase
+        panel._relevo_ventana = ventana
+        panel._cancelar_busqueda = mock.Mock()
+        panel._cancelar_transporte = mock.Mock()
+        panel.lbl_tiempo = mock.Mock()
+        panel.sld_pos = mock.Mock()
+        panel._estado_inicio = mock.Mock()
+        return panel
+
+    def _relevo(self):
+        relevo = mock.Mock()
+        relevo.iniciar.return_value = "tcp://127.0.0.1:6000"
+        relevo.esperar_listo.return_value = True
+        relevo.activo.return_value = True
+        return relevo
+
+    def _sincrono(self):
+        return (
+            mock.patch.object(reproductor.diagnostico, "crear_hilo",
+                              side_effect=lambda target, _n: mock.Mock(start=target)),
+            mock.patch.object(reproductor.wx, "CallAfter",
+                              side_effect=lambda fn, *a: fn(*a)),
+            mock.patch.object(reproductor.relevo_ffmpeg, "leer_ventana_hls",
+                              return_value=(5.0, 720)),
+        )
+
+    def test_retroceder_un_minuto_reinicia_ffmpeg_doce_segmentos_atras(self):
+        panel = self._panel()
+        viejo = panel._relevo_ffmpeg
+        nuevo = self._relevo()
+        hilo, callafter, ventana = self._sincrono()
+        with hilo, callafter, ventana, \
+                mock.patch.object(reproductor.relevo_ffmpeg, "RelevoFfmpeg",
+                                  return_value=nuevo) as clase, \
+                mock.patch.object(reproductor, "anunciar") as anunciar:
+            panel._buscar_rel(-60_000)
+        clase.assert_called_once_with("video-hls", "audio-hls", 12)
+        viejo.detener.assert_called_once()
+        self.assertIs(panel._relevo_ffmpeg, nuevo)
+        self.assertEqual(panel._relevo_desfase, 12)
+        panel._inst.media_new.assert_called_once_with("tcp://127.0.0.1:6000")
+        panel._player.play.assert_called_once()
+        panel._player.set_time.assert_not_called()
+        # La frase se dice al pulsar, una sola vez; al reconectar no se
+        # repite ni se anuncia «Reproduciendo».
+        self.assertEqual([c.args[0] for c in anunciar.call_args_list],
+                         ["1 minuto por detrás del directo"])
+        panel._estado_inicio.cancelar.assert_called()
+        panel.lbl_tiempo.SetLabel.assert_called_with("Directo, 1:00 atrás")
+        self.assertFalse(panel._cargando)
+
+    def test_los_saltos_se_encadenan_desde_el_desfase_actual(self):
+        panel = self._panel(desfase=12)
+        nuevo = self._relevo()
+        hilo, callafter, ventana = self._sincrono()
+        with hilo, callafter, ventana, \
+                mock.patch.object(reproductor.relevo_ffmpeg, "RelevoFfmpeg",
+                                  return_value=nuevo) as clase, \
+                mock.patch.object(reproductor, "anunciar") as anunciar:
+            panel._buscar_rel(-10_000)
+        clase.assert_called_once_with("video-hls", "audio-hls", 14)
+        self.assertEqual(anunciar.call_args.args[0],
+                         "1 minuto y 10 segundos por detrás del directo")
+
+    def test_adelantar_vuelve_al_directo(self):
+        panel = self._panel(desfase=12)
+        nuevo = self._relevo()
+        hilo, callafter, ventana = self._sincrono()
+        with hilo, callafter, ventana, \
+                mock.patch.object(reproductor.relevo_ffmpeg, "RelevoFfmpeg",
+                                  return_value=nuevo) as clase, \
+                mock.patch.object(reproductor, "anunciar") as anunciar:
+            panel._buscar_rel(+60_000)
+        clase.assert_called_once_with("video-hls", "audio-hls", 0)
+        self.assertEqual(anunciar.call_args.args[0], "En el directo")
+        panel.lbl_tiempo.SetLabel.assert_called_with("En directo")
+
+    def test_adelantar_en_el_borde_avisa_y_no_reinicia(self):
+        panel = self._panel(desfase=0)
+        with mock.patch.object(reproductor.relevo_ffmpeg, "RelevoFfmpeg") as clase, \
+                mock.patch.object(reproductor, "anunciar") as anunciar:
+            panel._buscar_rel(+60_000)
+        clase.assert_not_called()
+        panel._relevo_ffmpeg.detener.assert_not_called()
+        anunciar.assert_called_once_with("Ya estás en el directo")
+
+    def test_retroceder_al_final_de_la_ventana_avisa(self):
+        from busqueda_video import MARGEN_VENTANA_SEGMENTOS
+        panel = self._panel(desfase=720 - MARGEN_VENTANA_SEGMENTOS)
+        with mock.patch.object(reproductor.relevo_ffmpeg, "RelevoFfmpeg") as clase, \
+                mock.patch.object(reproductor, "anunciar") as anunciar:
+            panel._buscar_rel(-60_000)
+        clase.assert_not_called()
+        anunciar.assert_called_once_with("No se puede retroceder más en este directo")
+
+    def test_sin_ventana_leida_se_supone_una_corta(self):
+        panel = self._panel(ventana=None)
+        nuevo = self._relevo()
+        hilo, callafter, ventana = self._sincrono()
+        with hilo, callafter, ventana, \
+                mock.patch.object(reproductor.relevo_ffmpeg, "RelevoFfmpeg",
+                                  return_value=nuevo) as clase, \
+                mock.patch.object(reproductor, "anunciar"):
+            panel._buscar_rel(-60_000)
+        clase.assert_called_once_with("video-hls", "audio-hls", 12)
+
+    def test_mientras_carga_no_se_salta(self):
+        panel = self._panel()
+        panel._cargando = True
+        with mock.patch.object(reproductor.relevo_ffmpeg, "RelevoFfmpeg") as clase, \
+                mock.patch.object(reproductor, "anunciar") as anunciar:
+            panel._buscar_rel(-60_000)
+        clase.assert_not_called()
+        anunciar.assert_called_once_with("Cargando vídeo")
+
+    def test_si_el_nuevo_relevo_no_arranca_se_avisa_y_se_cae_a_input_slave(self):
+        panel = self._panel()
+        nuevo = self._relevo()
+        nuevo.iniciar.return_value = None
+        hilo, callafter, ventana = self._sincrono()
+        with hilo, callafter, ventana, \
+                mock.patch.object(reproductor.relevo_ffmpeg, "RelevoFfmpeg",
+                                  return_value=nuevo), \
+                mock.patch.object(reproductor, "anunciar") as anunciar:
+            panel._buscar_rel(-60_000)
+        self.assertEqual([c.args[0] for c in anunciar.call_args_list],
+                         ["1 minuto por detrás del directo", "No se pudo mover el directo"])
+        self.assertIsNone(panel._relevo_ffmpeg)
+        self.assertEqual(panel._relevo_desfase, 0)
+        panel._inst.media_new.assert_called_once_with("video-hls")
+
+    def test_la_ventana_se_lee_solo_en_el_primer_arranque(self):
+        panel = self._panel()
+        nuevo = self._relevo()
+        hilo, callafter, ventana = self._sincrono()
+        with hilo, callafter, ventana as leer, \
+                mock.patch.object(reproductor.relevo_ffmpeg, "RelevoFfmpeg",
+                                  return_value=nuevo), \
+                mock.patch.object(reproductor, "anunciar"):
+            panel._buscar_rel(-60_000)
+        leer.assert_not_called()   # ya había ventana: no se vuelve a bajar la lista
+
+    def test_detener_olvida_el_desfase_y_las_fuentes(self):
+        panel = self._panel(desfase=12)
+        panel._timer_progreso = mock.Mock()
+        panel._timer = mock.Mock()
+        panel._estado_busqueda = mock.Mock(pendiente=False)
+        panel._ciclo = None
+        panel._detener = reproductor.ReproductorPanel._detener.__get__(panel)
+        with mock.patch.object(reproductor, "anunciar"):
+            try:
+                panel._detener(silencioso=True)
+            except Exception:
+                pass   # el resto del método toca controles que aquí no existen
+        self.assertEqual(panel._relevo_desfase, 0)
+        self.assertIsNone(panel._relevo_fuentes)
+        self.assertIsNone(panel._relevo_ventana)
 
 
 class TestDirectoInterrumpido(unittest.TestCase):

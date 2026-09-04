@@ -427,12 +427,21 @@ class TestBusquedaBloqueadaVODDividido(unittest.TestCase):
         panel._inst = mock.Mock()
         return panel
 
+    def _solo_rechazo(self, registro):
+        # Un salto bloqueado no manda orden ni muestra alguna (ninguna traza
+        # SALTO/BUSQUEDA_*), pero sí deja escrito que se rechazó y por qué:
+        # antes «no me van los botones» no se distinguía de un botón roto.
+        self.assertEqual(len(registro.output), 1, registro.output)
+        self.assertIn("SALTO_RECHAZADO topologia=dividida", registro.output[0])
+        self.assertIn("motivo=vod_dividido", registro.output[0])
+
     def test_relativo_bloqueado_sin_set_time_ni_destino(self):
         import reproductor
         panel = self._panel_vod_dividido(confirmada=40_000)
         with mock.patch.object(reproductor, "anunciar") as anunciar:
-            with self.assertNoLogs("ytchat.reproductor", "DEBUG"):
+            with self.assertLogs("ytchat.reproductor", "DEBUG") as registro:
                 panel._buscar_rel(10_000)
+        self._solo_rechazo(registro)
         panel._player.set_time.assert_not_called()
         self.assertIsNone(panel._estado_busqueda.destino)
         panel._fijar_tiempo.assert_not_called()
@@ -442,8 +451,9 @@ class TestBusquedaBloqueadaVODDividido(unittest.TestCase):
         import reproductor
         panel = self._panel_vod_dividido()
         with mock.patch.object(reproductor, "anunciar") as anunciar:
-            with self.assertNoLogs("ytchat.reproductor", "DEBUG"):
+            with self.assertLogs("ytchat.reproductor", "DEBUG") as registro:
                 panel._buscar_porcentaje(50)
+        self._solo_rechazo(registro)
         panel._player.set_time.assert_not_called()
         self.assertIsNone(panel._estado_busqueda.destino)
         anunciar.assert_called_once_with("No se puede mover este vídeo mientras usa la fuente de internet")
@@ -452,8 +462,9 @@ class TestBusquedaBloqueadaVODDividido(unittest.TestCase):
         import reproductor
         panel = self._panel_vod_dividido()
         with mock.patch.object(reproductor, "anunciar") as anunciar:
-            with self.assertNoLogs("ytchat.reproductor", "DEBUG"):
+            with self.assertLogs("ytchat.reproductor", "DEBUG") as registro:
                 panel._on_sld_pos(None)
+        self._solo_rechazo(registro)
         panel._player.set_time.assert_not_called()
         self.assertIsNone(panel._estado_busqueda.destino)
         anunciar.assert_called_once_with("No se puede mover este vídeo mientras usa la fuente de internet")
@@ -464,10 +475,11 @@ class TestBusquedaBloqueadaVODDividido(unittest.TestCase):
         panel.sld_pos = mock.Mock()
         panel._player.get_length.return_value = 120_000
         with mock.patch.object(reproductor, "anunciar") as anunciar:
-            with self.assertNoLogs("ytchat.reproductor", "DEBUG"):
+            with self.assertLogs("ytchat.reproductor", "DEBUG") as registro:
                 event = mock.Mock()
                 event.GetKeyCode.return_value = reproductor.wx.WXK_RIGHT
                 panel._on_pos_key(event)
+        self._solo_rechazo(registro)
         panel._player.set_time.assert_not_called()
         anunciar.assert_called_once_with("No se puede mover este vídeo mientras usa la fuente de internet")
 

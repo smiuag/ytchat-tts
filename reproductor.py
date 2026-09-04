@@ -26,15 +26,17 @@ import wx
 import config as _cfg
 from busqueda_video import (
     EstadoBusqueda, EstadoInicioReproduccion, OrdenTransporte,
-    TOPE_BUSQUEDA_MS, accion_play_pausa, busqueda_permitida, destino_acumulado,
-    evaluar_transporte,
+    TOPE_BUSQUEDA_MS, VENTANA_HLS_SUPUESTA, accion_play_pausa,
+    busqueda_permitida, desfase_tras_salto, destino_acumulado,
+    evaluar_transporte, frase_desfase_directo,
 )
 import iconos
 import diagnostico
 import progreso
 from traza_transporte import (
     topologia_medio, traza_busqueda_desenlace, traza_busqueda_muestra,
-    traza_busqueda_orden, traza_inicio_muestra, traza_salto, traza_sin_barra,
+    traza_busqueda_orden, traza_inicio_muestra, traza_salto,
+    traza_salto_rechazado, traza_salto_relevo, traza_sin_barra,
     traza_transporte,
 )
 import ytdlp_bin
@@ -547,6 +549,12 @@ class ReproductorPanel(wx.Panel):
         # sincronía entre dos HLS independientemente en vivo cada 60-90 s.
         self._relevo_ffmpeg = None
         self._relevo_gen = 0
+        # Búsqueda en directo por relevo: fuentes (vídeo, audio) para poder
+        # reiniciar ffmpeg, segmentos por detrás del borde y ventana HLS
+        # (s por segmento, segmentos) leída al arrancar. Ver _saltar_en_relevo.
+        self._relevo_fuentes = None
+        self._relevo_desfase = 0
+        self._relevo_ventana = None
         # Recargas automáticas seguidas tras interrumpirse un directo por
         # relevo (ver _directo_interrumpido). Se reinicia al cambiar de vídeo.
         self._recargas_directo = 0
@@ -1365,44 +1373,62 @@ class ReproductorPanel(wx.Panel):
             # Vídeo y audio en vivo por separado: en vez de darle las dos
             # fuentes a VLC como input-slave (pierde la sincronía entre
             # ambas cada 60-90 s, comprobado con un directo real), un
-            # relevo de ffmpeg las remuxa antes en un único flujo. Arrancar
-            # el proceso y esperar a que su listener esté arriba no debe
-            # congelar la GUI, así que va en un hilo aparte.
-            self._relevo_gen = getattr(self, "_relevo_gen", 0) + 1
-            relevo_gen = self._relevo_gen
-            gen = self._gen
-            video_id_actual = self._video_id
-            # Mientras el relevo se prepara la carga sigue en curso: sin esto,
-            # pulsar Reproducir en ese segundo veía «sin medio», relanzaba
-            # yt-dlp y mataba el relevo recién arrancado.
-            self._cargando = True
-            self._fijar_estado("Cargando vídeo…")
-
-            def _preparar_relevo(video_url=url, audio_url=slave):
-                relevo = relevo_ffmpeg.RelevoFfmpeg(video_url, audio_url)
-                direccion = relevo.iniciar()
-                # Esperar a que ffmpeg escuche de verdad (sondea el puerto),
-                # no un tiempo fijo: VLC hace una única conexión y, si llega
-                # antes que el listener, queda en «error» sin reintentar.
-                if direccion and not relevo.esperar_listo():
-                    relevo.detener()
-                    direccion = None
-                wx.CallAfter(self._relevo_listo, relevo, direccion, relevo_gen,
-                            gen, video_id_actual, video_url, audio_url, reproducir)
-
-            diagnostico.crear_hilo(_preparar_relevo, "ReproductorRelevo").start()
+            # relevo de ffmpeg las remuxa antes en un único flujo.
+            self._relevo_ventana = None
+            self._arrancar_relevo(url, slave, reproducir)
             return
 
         self._tiene_esclavo = bool(slave)
         self._continuar_reproducir_calidad(url, slave, es_directo, reproducir)
 
+    def _arrancar_relevo(self, url, slave, reproducir, desfase=0, anuncio=None):
+        """Arranca ffmpeg (en un hilo: arrancar el proceso y esperar a que su
+        listener esté arriba no debe congelar la GUI) y sigue en _relevo_listo.
+
+        `desfase` son segmentos por detrás del borde del directo (0 = como
+        siempre); `anuncio` es la frase ya dicha al usuario cuando esto es un
+        salto, para no volver a anunciar «Reproduciendo» al reconectar.
+        """
+        self._relevo_gen = getattr(self, "_relevo_gen", 0) + 1
+        relevo_gen = self._relevo_gen
+        gen = self._gen
+        video_id_actual = self._video_id
+        # Mientras el relevo se prepara la carga sigue en curso: sin esto,
+        # pulsar Reproducir en ese segundo veía «sin medio», relanzaba
+        # yt-dlp y mataba el relevo recién arrancado.
+        self._cargando = True
+        self._fijar_estado("Cargando vídeo…")
+        leer_ventana = self._relevo_ventana is None
+
+        def _preparar_relevo(video_url=url, audio_url=slave):
+            relevo = relevo_ffmpeg.RelevoFfmpeg(video_url, audio_url, desfase)
+            direccion = relevo.iniciar()
+            # La ventana HLS (cuánto se puede retroceder) se lee una vez por
+            # directo, mientras ffmpeg sondea sus entradas.
+            ventana = relevo_ffmpeg.leer_ventana_hls(video_url) \
+                if direccion and leer_ventana else None
+            # Esperar a que ffmpeg escuche de verdad (sondea el puerto),
+            # no un tiempo fijo: VLC hace una única conexión y, si llega
+            # antes que el listener, queda en «error» sin reintentar.
+            if direccion and not relevo.esperar_listo():
+                relevo.detener()
+                direccion = None
+            wx.CallAfter(self._relevo_listo, relevo, direccion, relevo_gen,
+                         gen, video_id_actual, video_url, audio_url, reproducir,
+                         desfase, ventana, anuncio)
+
+        diagnostico.crear_hilo(_preparar_relevo, "ReproductorRelevo").start()
+
     def _relevo_listo(self, relevo, direccion, relevo_gen, gen, video_id_actual,
-                      url, slave, reproducir) -> None:
+                      url, slave, reproducir, desfase=0, ventana=None,
+                      anuncio=None) -> None:
         if relevo_gen != self._relevo_gen or gen != self._gen \
                 or video_id_actual != self._video_id:
             relevo.detener()
             return
         self._cargando = False
+        if ventana is not None:
+            self._relevo_ventana = ventana
         if direccion is not None and not relevo.activo():
             # ffmpeg murió entre el listener y este callback (403 de
             # googlevideo, playlist inválida): no darle a VLC una dirección
@@ -1413,13 +1439,26 @@ class ReproductorPanel(wx.Panel):
             # No se pudo levantar el relevo (sin ffmpeg, puerto, etc.): se
             # sigue con input-slave directo, como antes de tener el relevo.
             self._relevo_ffmpeg = None
+            self._relevo_fuentes = None
+            self._relevo_desfase = 0
             self._tiene_esclavo = bool(slave)
+            if anuncio:
+                anunciar("No se pudo mover el directo")
             self._continuar_reproducir_calidad(url, slave, True, reproducir)
             return
         self._relevo_ffmpeg = relevo
+        self._relevo_fuentes = (url, slave)
+        self._relevo_desfase = int(desfase or 0)
         self._relevo_reintentos = 0
         self._tiene_esclavo = False
         self._continuar_reproducir_calidad(direccion, "", True, reproducir)
+        if anuncio and self._relevo_ffmpeg is relevo:
+            # Salto: la frase ya se dijo al pulsar; aquí solo se refleja en
+            # pantalla y se evita el «Reproduciendo» del inicio normal.
+            if hasattr(self, "_estado_inicio"):
+                self._estado_inicio.cancelar()
+            self._fijar_estado(anuncio + ".")
+            self._fijar_tiempo(0, 0, mover_slider=False, anunciar_t=False)
 
     def _continuar_reproducir_calidad(self, url, slave, es_directo, reproducir):
         try:
@@ -1646,6 +1685,9 @@ class ReproductorPanel(wx.Panel):
             tarea.cancelacion.set()
             self._tarea_cache_video = None
         self._detener_relevo_ffmpeg()
+        self._relevo_fuentes = None
+        self._relevo_desfase = 0
+        self._relevo_ventana = None
         self._intencion_reproducir = False
         self._timer_progreso.Stop()
         if self._player is not None:
@@ -1775,7 +1817,7 @@ class ReproductorPanel(wx.Panel):
             # el deslizador de su rango 0-1000.
             self.lbl_tiempo.SetLabel(_fmt_t(self._pos_ms))
         else:
-            self.lbl_tiempo.SetLabel("En directo")
+            self.lbl_tiempo.SetLabel(self._etiqueta_directo())
         if mover_slider and self._dur_ms > 0:
             self.sld_pos.SetValue(max(0, min(1000, int(self._pos_ms / self._dur_ms * 1000))))
         if anunciar_t:
@@ -1863,7 +1905,7 @@ class ReproductorPanel(wx.Panel):
         if self._player is None:
             return
         if not self._busqueda_permitida_actual():
-            self._aviso_busqueda_no_permitida()
+            self._aviso_busqueda_no_permitida("deslizador")
             return
         dur = self._player.get_length()
         if dur <= 0:
@@ -1897,7 +1939,7 @@ class ReproductorPanel(wx.Panel):
         if self._player is None:
             return
         if not self._busqueda_permitida_actual():
-            self._aviso_busqueda_no_permitida()
+            self._aviso_busqueda_no_permitida("porcentaje")
             return
         dur = self._player.get_length()
         if dur <= 0:
@@ -2037,11 +2079,63 @@ class ReproductorPanel(wx.Panel):
         self._fijar_estado("No se pudo reproducir el vídeo.")
         anunciar("No se pudo reproducir el vídeo")
 
-    def _aviso_busqueda_no_permitida(self) -> None:
+    def _aviso_busqueda_no_permitida(self, origen="relativo") -> None:
         if getattr(self, "_relevo_ffmpeg", None) is not None:
-            anunciar("En este directo no se puede adelantar ni retroceder")
+            motivo = "relevo_sin_barra"
+            anunciar("En este directo solo se puede retroceder o adelantar "
+                     "con los botones o las flechas")
         else:
+            motivo = "vod_dividido"
             anunciar("No se puede mover este vídeo mientras usa la fuente de internet")
+        logger.debug("%s", traza_salto_rechazado(self._topologia_actual(), origen, motivo))
+
+    def _desfase_relevo_segundos(self) -> float:
+        ventana = self._relevo_ventana or VENTANA_HLS_SUPUESTA
+        return self._relevo_desfase * float(ventana[0])
+
+    def _etiqueta_directo(self) -> str:
+        if getattr(self, "_relevo_ffmpeg", None) is not None and self._relevo_desfase > 0:
+            return f"Directo, {_fmt_t(self._desfase_relevo_segundos() * 1000)} atrás"
+        return "En directo"
+
+    def _saltar_en_relevo(self, delta_ms: int) -> None:
+        """Retroceder o adelantar en un directo por relevo.
+
+        VLC ve el relevo como un flujo sin ventana de retroceso, así que
+        set_time() no sirve. En su lugar se reinicia ffmpeg unos segmentos
+        antes del borde del directo (la lista HLS de YouTube guarda una hora
+        de segmentos de 5 s). Cuesta un corte de 2-3 s por salto; la frase se
+        anuncia al pulsar, no al reconectar, para que la respuesta sea
+        inmediata para quien no ve la pantalla.
+        """
+        topologia = self._topologia_actual()
+        if self._cargando or self._relevo_fuentes is None:
+            logger.debug("%s", traza_salto_rechazado(topologia, "relativo", "cargando"))
+            anunciar("Cargando vídeo")
+            return
+        segmento_s, ventana_seg = self._relevo_ventana or VENTANA_HLS_SUPUESTA
+        segmento_ms = int(segmento_s * 1000)
+        antes = self._relevo_desfase
+        despues = desfase_tras_salto(antes, delta_ms, segmento_ms, ventana_seg)
+        if despues == antes:
+            motivo = "en_el_directo" if delta_ms > 0 else "fin_de_ventana"
+            logger.debug("%s", traza_salto_rechazado(topologia, "relativo", motivo))
+            anunciar("Ya estás en el directo" if delta_ms > 0
+                     else "No se puede retroceder más en este directo")
+            return
+        logger.debug("%s", traza_salto_relevo(delta_ms, antes, despues,
+                                               segmento_ms, ventana_seg))
+        frase = frase_desfase_directo(despues * segmento_s)
+        anunciar(frase)
+        url, slave = self._relevo_fuentes
+        self._cancelar_busqueda()
+        self._cancelar_transporte()
+        self._detener_relevo_ffmpeg()
+        # Se conserva el desfase pedido mientras arranca el nuevo relevo para
+        # que un segundo pulso encadene desde aquí y no desde el borde.
+        self._relevo_desfase = despues
+        self._relevo_fuentes = (url, slave)
+        self._arrancar_relevo(url, slave, True, desfase=despues, anuncio=frase)
 
     def _buscar_rel(self, delta_ms: int):
         if self._player is None:
@@ -2050,11 +2144,14 @@ class ReproductorPanel(wx.Panel):
             if aviso:
                 anunciar(aviso)
             return
+        if getattr(self, "_relevo_ffmpeg", None) is not None and self._es_directo_actual():
+            self._saltar_en_relevo(delta_ms)
+            return
         # La permisión va antes que la duración: con el relevo de ffmpeg VLC
         # devuelve length=0 y, mirando primero dur, el aviso específico de
         # «no se puede buscar en este directo» no llegaba nunca.
         if not self._busqueda_permitida_actual():
-            self._aviso_busqueda_no_permitida()
+            self._aviso_busqueda_no_permitida("relativo")
             return
         dur = self._player.get_length()
         if dur <= 0:
