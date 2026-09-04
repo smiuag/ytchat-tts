@@ -43,6 +43,9 @@ historial.csv
 historial.txt
 # Historial de directos vistos (ventana Historial)
 historial_lives.json
+# Registro y carpeta del gestor de descargas (URLs, rutas y vídeos enteros)
+/historial_descargas.json
+/Descargas/
 
 # Andamiaje de trabajo con agentes: no se versiona.
 # Viaja si se copia la carpeta, no con un git clone.

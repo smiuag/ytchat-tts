@@ -3,6 +3,63 @@
 Qué cambia en cada versión, en lenguaje llano. El detalle técnico está en el
 historial de git.
 
+## Próxima versión (en desarrollo, septiembre de 2026)
+
+Revisión general del código con arreglos en el reproductor, la voz, OBS, las
+descargas y la ventana de Preferencias.
+
+- **Los directos ya no se congelan cada minuto y medio.** El vídeo y el audio
+  de un directo llegan por separado y el reproductor perdía la sincronía entre
+  ambos cada 60-90 segundos, quedándose parado 25-50 segundos. Ahora se juntan
+  antes con ffmpeg en un único flujo. Si ffmpeg tarda en arrancar, el
+  reproductor espera a que esté listo en vez de fallar en silencio; si el
+  directo se corta, lo dice y vuelve a conectar solo (hasta dos veces).
+- **Retroceder en un directo ya no salta dos horas atrás.** El reproductor se
+  fiaba de una duración falsa que daba VLC y un retroceso de un minuto acababa
+  al principio de la ventana del directo.
+- **El primer mensaje tras reconectar ya no se corta.** Una orden de callar
+  pendiente se aplicaba al mensaje siguiente a los 100 milisegundos.
+- **La voz configurada que ya no existe no impide arrancar.** Se usa la
+  primera disponible y se anota en el registro.
+- **Pausar la lectura (F5) pausa de verdad la frase en curso**, y mientras está
+  en pausa se atienden cambios de voz, velocidad y volumen.
+- **Iniciar sesión otra vez tras cerrarla vuelve a funcionar.** Antes Google
+  devolvía un permiso incompleto y moderar, comentar o escribir en el chat
+  fallaba con un error de formato.
+- **Los Super Chats en yenes, wones o rupias suman bien.** «¥1,000» sumaba 1.
+- **Al reconectar a un directo distinto, los mensajes automáticos y el
+  compositor ya no pueden acabar en el chat anterior**, ni los comentarios del
+  vídeo anterior en el nuevo.
+- **Reconectar de verdad cuenta.** Con la wifi inestable, cinco microcortes
+  repartidos en horas agotaban los intentos aunque cada reconexión hubiera
+  funcionado. Solo cuentan los fallos seguidos.
+- **Desconectar mientras dice «Conectando…» ahora es posible**, y cerrar la app
+  no espera a que termine una consulta a YouTube.
+- **OBS: el tiempo de transmisión era mil veces mayor.** Un minuto se anunciaba
+  como «16 horas 40 minutos».
+- **La ventana de Transmisión no se queda bloqueada** si la fuente elegida ha
+  desaparecido en OBS o si OBS cierra la conexión: avisa y deja seguir.
+  «Aplicar tamaño» sobre un panel escalado ya no lo encoge a la mitad.
+- **El panel de chat en la emisión no repite mensajes** cuando se apaga y se
+  enciende rápido.
+- **Preferencias: la pestaña Atajos se ve entera.** Antes dos tercios de los
+  botones quedaban fuera de la ventana. Ahora las pestañas se desplazan y la
+  ventana se puede agrandar.
+- **Alt+Enter en la lista del chat abre el compositor** en vez de copiar el
+  mensaje. «Ir a Comentarios» ya no se anuncia dos veces.
+- **Modo de contraste alto de Windows respetado.** La aplicación dejaba de
+  aplicar sus colores fijos encima del tema del sistema.
+- **Descargas:** la carpeta «Descargas» siempre está junto a la aplicación
+  (antes dependía de desde dónde se abría); el nombre que se anuncia y se
+  guarda es el del archivo final, no el de un trozo temporal; «Enumerar» ya no
+  antepone «NA - » a los vídeos sueltos; cancelar mata también a ffmpeg y borra
+  los restos; las descargas que terminan con la ventana cerrada entran en el
+  historial; al reabrir la ventana el progreso sigue vivo.
+- **Los archivos que la app guarda (historial, credenciales, mensajes
+  programados y la configuración de OBS) se escriben de forma segura**: un
+  cierre a mitad ya no los deja vacíos.
+- **Los sonidos largos de temas personalizados ya no se cortan a los 5 s.**
+
 ## 2.1.0 — agosto de 2026
 
 Esta versión añade un panel de chat para mostrar en la emisión, la posibilidad

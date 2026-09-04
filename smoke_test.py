@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import csv
 import os
+import re
 import subprocess
 import sys
 
@@ -35,11 +36,31 @@ AQUI = os.path.dirname(os.path.abspath(__file__))
 # de accesibilidad.
 _INTERACTIVOS = {"Button", "Edit", "ComboBox", "List", "CheckBox", "RadioButton"}
 
-_MODULOS_PUROS = ["config", "tts_worker", "montos", "sound_player",
-                  "credenciales", "youtube_api", "deteccion", "main",
-                  "descargas"]
-_MODULOS_GUI = ["gui", "iconos", "gui_comentarios", "gui_preferencias",
-                "gui_historial", "reproductor", "gui_descargas"]
+
+
+def _modulos_de_la_raiz() -> tuple[list[str], list[str]]:
+    """(módulos puros, módulos de GUI) leídos de los .py de la raíz.
+
+    Antes era una lista a mano y se quedaba corta: cada módulo nuevo
+    (relevo_ffmpeg, obs_*, overlay_*, programados…) se quedaba fuera del
+    smoke sin que nadie lo notara. Es de GUI si importa wx a nivel de módulo;
+    los que lo importan dentro de una función (main) siguen siendo puros.
+    """
+    puros, gui = [], []
+    for nombre in sorted(os.listdir(AQUI)):
+        if not nombre.endswith(".py") or nombre == os.path.basename(__file__):
+            continue
+        with open(os.path.join(AQUI, nombre), encoding="utf-8", errors="replace") as f:
+            fuente = f.read()
+        modulo = nombre[:-3]
+        if re.search(r"^(?:import wx|from wx)", fuente, re.M):
+            gui.append(modulo)
+        else:
+            puros.append(modulo)
+    return puros, gui
+
+
+_MODULOS_PUROS, _MODULOS_GUI = _modulos_de_la_raiz()
 
 _PREFIJO_TITULO = "YTChat TTS"
 _PROCESOS_APLICACION = {"python.exe", "pythonw.exe", "ytchattts.exe"}
