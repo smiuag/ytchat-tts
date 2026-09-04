@@ -13,7 +13,7 @@ import diagnostico
 import wx
 
 import historial
-from gui import anunciar, nombre_accesible, _T
+from gui import anunciar, nombre_accesible, _T, _pintar
 
 logger = diagnostico.obtener_logger(__name__)
 
@@ -28,14 +28,13 @@ class HistorialDialog(wx.Dialog):
         self._ruta = ruta
         self._on_conectar = on_conectar
         self._lista = historial.cargar(ruta)
-        self.SetBackgroundColour(_T.bg)
+        _pintar(self, bg=_T.bg)
         self._build_ui()
         self.Centre()
 
     def _build_ui(self):
         panel = wx.Panel(self, name="PanelHistorial")
-        panel.SetBackgroundColour(_T.bg)
-        panel.SetForegroundColour(_T.text)
+        _pintar(panel, _T.bg, _T.text)
         vs = wx.BoxSizer(wx.VERTICAL)
 
         nota = wx.StaticText(panel, name="NotaHistorial", label=(
@@ -43,7 +42,7 @@ class HistorialDialog(wx.Dialog):
             "lo quita. Los marcados «· directo» eran emisiones en vivo: los de "
             "TikTok se reconectan si el usuario está en vivo; un directo de "
             "YouTube ya terminado no volverá, pero un vídeo normal sí."))
-        nota.SetForegroundColour(_T.dim)
+        _pintar(nota, fg=_T.dim)
         nota.Wrap(560)
         vs.Add(nota, 0, wx.ALL, 10)
 
@@ -52,12 +51,11 @@ class HistorialDialog(wx.Dialog):
         self._entradas: dict[str, list] = {}
         for titulo, plat in _PLATAFORMAS:
             pag = wx.Panel(self.nb, name=f"PagHistorial_{plat}")
-            pag.SetBackgroundColour(_T.bg)
+            _pintar(pag, bg=_T.bg)
             pvs = wx.BoxSizer(wx.VERTICAL)
             lb = wx.ListBox(pag, style=wx.LB_SINGLE | wx.LB_HSCROLL,
                             name=f"Historial de {titulo}")
-            lb.SetBackgroundColour(_T.field)
-            lb.SetForegroundColour(_T.text)
+            _pintar(lb, _T.field, _T.text)
             nombre_accesible(lb, f"Historial de {titulo}")
             lb.Bind(wx.EVT_LISTBOX_DCLICK, lambda e: self._conectar())
             lb.Bind(wx.EVT_KEY_DOWN, self._on_key)
@@ -73,8 +71,7 @@ class HistorialDialog(wx.Dialog):
         self.btn_quitar   = wx.Button(panel, label="&Quitar", name="QuitarHistorial")
         btn_cerrar        = wx.Button(panel, wx.ID_CANCEL, "C&errar", name="CerrarHistorial")
         for b in (self.btn_conectar, self.btn_quitar, btn_cerrar):
-            b.SetBackgroundColour(_T.btn)
-            b.SetForegroundColour(_T.btn_t)
+            _pintar(b, _T.btn, _T.btn_t)
             row.Add(b, 0, wx.RIGHT, 6)
         vs.Add(row, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
 

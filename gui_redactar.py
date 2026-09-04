@@ -39,6 +39,10 @@ class PanelRedactar(wx.Panel):
         base = self.boton.GetLabel().split(" (")[0]
         self.boton.SetLabel(redaccion.etiqueta_con_motivo(base, self._motivo))
 
+    def motivo(self) -> str:
+        """Por qué no se puede enviar ahora («» si se puede)."""
+        return self._motivo
+
     def enfocar(self) -> None:
         self.texto.SetFocus()
 

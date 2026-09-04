@@ -22,7 +22,7 @@ import redaccion
 from gui_redactar import DialogoRedactar
 from gui import (
     anunciar, copiar_al_portapapeles, nombre_accesible, instalar_busqueda_tipo,
-    _T, _tc,
+    _T, _tc, _pintar,
 )
 
 logger = diagnostico.obtener_logger(__name__)
@@ -42,12 +42,15 @@ class ComentariosPanel(wx.Panel):
         self._next_token = ""
         self._cargando = False
         self._comentarios_cerrados = False
+        # Generación del vídeo: cada set_video/limpiar la sube y el hilo de
+        # carga la lleva consigo, así una página que llega tarde (del vídeo
+        # anterior) no aterriza en el nuevo ni deja «Cargar más» paginándolo.
+        self._generacion = 0
         # ids ya mostrados: con orden «relevancia» YouTube devuelve páginas que se
         # solapan o se repiten, así que deduplicamos para no contar/añadir repetidos.
         self._ids_vistos: set[str] = set()
 
-        self.SetBackgroundColour(_T.bg)
-        self.SetForegroundColour(_T.text)
+        _pintar(self, _T.bg, _T.text)
         self._build_ui()
 
     # ── UI ───────────────────────────────────────────────────────────────────
@@ -58,7 +61,7 @@ class ComentariosPanel(wx.Panel):
         # Fila de control: orden + recargar. Sin campo URL: usa el de la barra.
         row = wx.BoxSizer(wx.HORIZONTAL)
         lbl = wx.StaticText(self, label="&Orden:", name="EtiquetaOrden")
-        lbl.SetForegroundColour(_T.dim)
+        _pintar(lbl, fg=_T.dim)
         row.Add(lbl, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
         self.cho_orden = wx.Choice(self, choices=[o[0] for o in _ORDENES],
                                    name="Orden de comentarios")
@@ -80,7 +83,7 @@ class ComentariosPanel(wx.Panel):
 
         # Lista
         lbl = wx.StaticText(self, label="Co&mentarios:", name="EtiquetaListaComentarios")
-        lbl.SetForegroundColour(_T.accent)
+        _pintar(lbl, fg=_T.accent)
         vs.Add(lbl, 0, wx.LEFT | wx.RIGHT, 8)
         self.lb = wx.ListBox(self, style=wx.LB_SINGLE | wx.LB_HSCROLL,
                              name="Lista de comentarios")
@@ -141,19 +144,21 @@ class ComentariosPanel(wx.Panel):
 
     def set_video(self, video_id: str, autocargar: bool = True) -> None:
         """Fija el vídeo objetivo y, por defecto, carga la primera página."""
-        self._video_id = video_id or ""
-        self._comentarios_cerrados = False
-        self.lb.Clear()
-        self._coms.clear()
-        self._ids_vistos.clear()
-        self._next_token = ""
-        self.btn_mas.Disable()
+        self._reiniciar(video_id or "")
         self._actualizar_botones_sesion()
         if autocargar and self._video_id:
             self._cargar_pagina("")
 
     def limpiar(self) -> None:
-        self._video_id = ""
+        self._reiniciar("")
+
+    def _reiniciar(self, video_id: str) -> None:
+        self._generacion += 1
+        # Una carga en curso pertenece al vídeo anterior: se descartará al
+        # llegar, así que no debe bloquear la del nuevo ni dejar Recargar apagado.
+        self._cargando = False
+        self.btn_recargar.Enable()
+        self._video_id = video_id
         self._comentarios_cerrados = False
         self.lb.Clear()
         self._coms.clear()
@@ -202,22 +207,30 @@ class ComentariosPanel(wx.Panel):
         self._cargando = True
         self.btn_recargar.Disable()
         self.btn_mas.Disable()
-        anunciar("Cargando comentarios")
+        # No urgente: al conectar coincide con el anuncio de «conectado» y no
+        # debe pisarlo.
+        anunciar("Cargando comentarios", urgente=False)
         orden = _ORDENES[max(0, self.cho_orden.GetSelection())][1]
         vid = self._video_id
+        generacion = self._generacion
 
         def _run():
             try:
                 cli = self._cliente()
                 coms, nxt = cli.leer_comentarios(vid, page_token=page_token, orden=orden)
-                wx.CallAfter(self._pagina_ok, coms, nxt)
+                wx.CallAfter(self._pagina_ok, coms, nxt, generacion)
             except Exception as exc:
                 logger.warning("leer_comentarios: %s", exc)
-                wx.CallAfter(self._pagina_err, exc)
+                wx.CallAfter(self._pagina_err, exc, generacion)
 
         diagnostico.crear_hilo(_run, "Comentarios").start()
 
-    def _pagina_ok(self, coms, nxt):
+    def _es_de_otro_video(self, generacion) -> bool:
+        return generacion is not None and generacion != self._generacion
+
+    def _pagina_ok(self, coms, nxt, generacion=None):
+        if self._es_de_otro_video(generacion):
+            return
         self._cargando = False
         self.btn_recargar.Enable()
         anteriores = self.lb.GetCount()
@@ -255,7 +268,9 @@ class ComentariosPanel(wx.Panel):
         else:
             anunciar("No hay comentarios para mostrar.")
 
-    def _pagina_err(self, exc):
+    def _pagina_err(self, exc, generacion=None):
+        if self._es_de_otro_video(generacion):
+            return
         self._cargando = False
         self.btn_recargar.Enable()
         # Si había más páginas pendientes, que un error transitorio no deje
@@ -300,7 +315,9 @@ class ComentariosPanel(wx.Panel):
             event.Skip()
 
     def _on_char_hook(self, event):
-        if event.GetKeyCode() in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+        if (event.GetKeyCode() in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER)
+                and event.GetModifiers() == wx.MOD_NONE):
+            # Solo Enter a secas: Alt+Enter es un acelerador del menú.
             self._leer()
         else:
             event.Skip()
@@ -424,5 +441,4 @@ class ComentariosPanel(wx.Panel):
 
 
 def _btn(b: wx.Button) -> None:
-    b.SetBackgroundColour(_T.btn)
-    b.SetForegroundColour(_T.btn_t)
+    _pintar(b, _T.btn, _T.btn_t)

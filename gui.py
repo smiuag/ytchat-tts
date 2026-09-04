@@ -24,7 +24,7 @@ from config import (
     TIPO_TEXTO, TIPO_SUPERCHAT, TIPO_STICKER, TIPO_MIEMBRO, TIPO_ENTRADA,
     FILTROS,
 )
-from config import (parsear_atajos, detectar_conflictos_atajos, ATAJOS_DEFAULTS,
+from config import (parsear_atajos, detectar_conflictos_atajos,
                     app_dir, guardar_opcion)
 import deteccion
 import metadatos
@@ -128,6 +128,13 @@ def _ao2_init():
 
 def anunciar(texto: str, urgente: bool = True) -> None:
     if _ao2 is None:
+        return
+    if not wx.IsMainThread():
+        # accessible_output2 habla por COM (SAPI, JAWS) y no es seguro desde
+        # otros hilos; el vigilante de OBS y las descargas anuncian desde los
+        # suyos, así que se reenvía al hilo de la interfaz.
+        try:    wx.CallAfter(anunciar, texto, urgente)
+        except Exception: pass
         return
     try:
         # Casi todos responden a una tecla y deben llegar antes del próximo foco.
@@ -288,25 +295,21 @@ def instalar_busqueda_tipo(listbox: wx.ListBox, obtener_textos) -> None:
     listbox.Bind(wx.EVT_CHAR, _on_char)
 
 
-# ── Paleta «crema + salvia» (PALETA-COLORES.md, modo claro tal cual) ────────
-# Fondo crema y salvia como color de marca, igual que en el md de origen.
-# `accent`/`accent2`/`gold`/`green`/`red` son texto (secciones, estados),
-# no fondos: el md no da variantes de texto para esos tonos porque en su app
-# solo se usan como fondo/relleno, así que aquí se oscurecieron lo justo para
-# llegar a 4.5:1 sobre el fondo. Contraste comprobado con la fórmula WCAG en
-# cada par texto/fondo real de la app; todos dan 4.5:1 o más.
+# ── Paleta «crema + salvia» (ver PALETA-COLORES.md) ─────────────────────────
+# Fondo crema, salvia como color de marca y muy pocos tonos con papel fijo.
+# `accent` y `red` son colores de TEXTO (secciones, estados, errores), no
+# fondos: son la salvia y el rojo oscurecidos lo justo para dar 4.5:1 sobre
+# el fondo. Contraste comprobado con la fórmula WCAG en cada par texto/fondo
+# real de la app; todos dan 4.5:1 o más. Con el contraste alto de Windows
+# activado (ALTO_CONTRASTE) la paleta no se aplica y manda el tema del sistema.
 
 class _T:
     bg      = wx.Colour(247, 244, 238)  # #F7F4EE  crema (fondo de marca)
     surface = wx.Colour(255, 255, 255)  # #FFFFFF  paneles, grupos, pestañas
     field   = wx.Colour(233, 225, 211)  # #E9E1D3  campos (secundario/beige)
-    border  = wx.Colour(227, 220, 207)  # #E3DCCF
     text    = wx.Colour(51,  51,  51)   # #333333  texto principal
     dim     = wx.Colour(107, 107, 107)  # #6B6B6B  texto secundario
     accent  = wx.Colour(63,  91,  58)   # #3F5B3A  salvia oscurecida (primario, texto)
-    accent2 = wx.Colour(138, 90,  82)   # #8A5A52  rosa oscurecida (secundario, texto)
-    gold    = wx.Colour(131, 99,  11)   # #83630B  Super Chats
-    green   = wx.Colour(46,  107, 50)   # #2E6B32  conectado / éxito
     red     = wx.Colour(179, 38,  30)   # #B3261E  error
     btn     = wx.Colour(233, 225, 211)  # botones secundarios (= field)
     btn_t   = wx.Colour(51,  51,  51)
@@ -315,9 +318,42 @@ class _T:
     primary_t = wx.Colour(51,  51,  51)
 
 
+def _detectar_alto_contraste() -> bool:
+    """¿Windows tiene activado un tema de alto contraste? (SPI_GETHIGHCONTRAST)"""
+    try:
+        import ctypes
+
+        class _HighContrast(ctypes.Structure):
+            _fields_ = [("cbSize", ctypes.c_uint), ("dwFlags", ctypes.c_uint),
+                        ("lpszDefaultScheme", ctypes.c_wchar_p)]
+
+        datos = _HighContrast()
+        datos.cbSize = ctypes.sizeof(_HighContrast)
+        if ctypes.windll.user32.SystemParametersInfoW(
+                0x42, datos.cbSize, ctypes.byref(datos), 0):   # SPI_GETHIGHCONTRAST
+            return bool(datos.dwFlags & 1)                      # HCF_HIGHCONTRASTON
+    except Exception:
+        pass
+    return False
+
+
+# Con alto contraste la paleta propia pisaría los colores que el usuario eligió
+# precisamente para ver: en ese caso no se pinta nada y mandan los del sistema.
+ALTO_CONTRASTE = _detectar_alto_contraste()
+
+
+def _pintar(w, bg=None, fg=None):
+    """Aplica colores de la paleta a un control, salvo en alto contraste."""
+    if ALTO_CONTRASTE:
+        return
+    if bg is not None:
+        w.SetBackgroundColour(bg)
+    if fg is not None:
+        w.SetForegroundColour(fg)
+
+
 def _tc(w, bg=None, fg=None):
-    w.SetBackgroundColour(bg or _T.field)
-    w.SetForegroundColour(fg or _T.text)
+    _pintar(w, bg or _T.field, fg or _T.text)
 
 
 class ContadorAccesible(wx.SpinCtrl):
@@ -333,7 +369,7 @@ class ContadorAccesible(wx.SpinCtrl):
 
 def _titulo(w, color=None):
     """Etiqueta de sección: color de acento y seminegrita, para jerarquía."""
-    w.SetForegroundColour(color or _T.accent)
+    _pintar(w, fg=color or _T.accent)
     w.SetFont(w.GetFont().Bold())
 
 
@@ -423,6 +459,8 @@ class YTChatFrame(wx.Frame):
         self._alive     = True
         self._apagando  = False
         self._conectado = False
+        self._conectando = False   # entre pulsar Conectar y la respuesta
+        self._texto_tipo = MENSAJE_INICIAL   # texto de lbl_tipo sin saltos de Wrap
         self._titulo_stream = ""
         self._tipo_video = deteccion.DESCONOCIDO
         self._es_tiktok = False   # para que F2 distinga TikTok de YouTube (ambos LIVE)
@@ -437,6 +475,7 @@ class YTChatFrame(wx.Frame):
 
         self._sc_totales: dict[str, float] = {}
         self._live_chat_id = ""
+        self._video_id_sesion = ""   # vídeo de YouTube de la conexión vigente
         self._causa_sin_chat = ""
         self._mensajes_programados = programados.cargar(
             app_dir() / "mensajes_programados.json")
@@ -458,7 +497,7 @@ class YTChatFrame(wx.Frame):
         self._diagnostico_parada = threading.Event()
         self._obs_vigilante = None
 
-        self.SetBackgroundColour(_T.bg)
+        _pintar(self, bg=_T.bg)
         self._build_menubar()
         if self._config.get("overlay_activo", False):
             self._cambiar_overlay(True)
@@ -487,6 +526,7 @@ class YTChatFrame(wx.Frame):
             self.Bind(wx.EVT_MENU, lambda e: wx.CallAfter(fn, *args), item)
 
     def _build_menubar(self):
+        anterior = self.GetMenuBar()
         mb = wx.MenuBar()
 
         # Archivo
@@ -602,7 +642,7 @@ class YTChatFrame(wx.Frame):
         mi_rep_volM  = m.Append(wx.ID_ANY, "S&ubir volumen del reproductor" + self._accel("rep_vol_mas"))
         m.AppendSeparator()
         self.mi_rep_botones = m.AppendCheckItem(wx.ID_ANY, "Mostrar botones en &pantalla")
-        self.mi_rep_botones.Check(bool(self._config.get("mostrar_botones_reproductor", False)))
+        self.mi_rep_botones.Check(bool(self._config.get("mostrar_botones_reproductor", True)))
         self._bind_menu(self.mi_rep_botones, self._toggle_botones_rep)
         mb.Append(m, "&Reproductor")
         self._bind_menu(mi_rep_play, self._rep_accion, "_toggle_play")
@@ -661,6 +701,19 @@ class YTChatFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, lambda e: wx.CallAfter(self._on_about, None), mi_about)
 
         self.SetMenuBar(mb)
+        # Al reconstruir (Preferencias), la barra vieja solo se desengancha: hay
+        # que destruirla, y el item de pausa nace como «Pausar» aunque la
+        # lectura siga pausada.
+        if anterior is not None:
+            try:    anterior.Destroy()
+            except Exception: pass
+        self._sincronizar_pausa()
+
+    def _sincronizar_pausa(self) -> None:
+        try:    pausado = bool(self._worker.esta_pausado())
+        except Exception: return
+        self.mi_pausa.SetItemLabel(
+            ("&Reanudar lectura" if pausado else "&Pausar lectura") + self._accel("pausa"))
 
     def _cambiar_overlay(self, encender):
         puerto = self._config.get("overlay_puerto", 8730)
@@ -747,8 +800,7 @@ class YTChatFrame(wx.Frame):
         from reproductor import ReproductorPanel
 
         panel = wx.Panel(self, name="PanelPrincipal")
-        panel.SetBackgroundColour(_T.bg)
-        panel.SetForegroundColour(_T.text)
+        _pintar(panel, _T.bg, _T.text)
         vs = wx.BoxSizer(wx.VERTICAL)
 
         # ── Barra superior: URL + tipo + Conectar ──
@@ -764,14 +816,16 @@ class YTChatFrame(wx.Frame):
             "YouTube. Pulsa Enter para conectar.")
         row.Add(self.txt_url, 1, wx.EXPAND | wx.RIGHT, 8)
         self.btn_conectar = wx.Button(panel, label="&Conectar", name="Conectar")
-        self.btn_conectar.SetBackgroundColour(_T.primary)
-        self.btn_conectar.SetForegroundColour(_T.primary_t)
+        _pintar(self.btn_conectar, _T.primary, _T.primary_t)
         self.btn_conectar.SetFont(self.btn_conectar.GetFont().Bold())
         row.Add(self.btn_conectar, 0, wx.ALIGN_CENTER_VERTICAL)
         vs.Add(row, 0, wx.EXPAND | wx.ALL, 12)
 
-        self.lbl_tipo = wx.StaticText(panel, label=MENSAJE_INICIAL, name="TipoVideo")
-        self.lbl_tipo.SetForegroundColour(_T.dim)
+        self.lbl_tipo = wx.StaticText(panel, label=self._texto_tipo, name="TipoVideo")
+        _pintar(self.lbl_tipo, fg=_T.dim)
+        # Ancho mínimo fijo: si no, el mínimo del sizer (y el piso de la
+        # ventana) seguiría al texto sin partir, es decir, al ancho actual.
+        self.lbl_tipo.SetMinSize((200, -1))
         self.lbl_tipo.Wrap(ANCHO_DEFECTO - 40)
         vs.Add(self.lbl_tipo, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
 
@@ -779,7 +833,7 @@ class YTChatFrame(wx.Frame):
         # conexión y se vuelve a ocultar al desconectar (queda solo la barra
         # superior), para que no aparezca todo a medio cargar. ──
         self._zona = wx.Panel(panel, name="ZonaContenido")
-        self._zona.SetBackgroundColour(_T.bg)
+        _pintar(self._zona, bg=_T.bg)
         zvs = wx.BoxSizer(wx.VERTICAL)
 
         self.nb = wx.Notebook(self._zona, name="Paneles")
@@ -830,16 +884,15 @@ class YTChatFrame(wx.Frame):
 
         # 7 campos: estado, velocidad, voz, cola, leídos, volumen, total SC.
         self.sb = self.CreateStatusBar(7, name="BarraEstado")
-        self.sb.SetBackgroundColour(_T.surface)
-        self.sb.SetForegroundColour(_T.dim)
+        # (Sin fondo: la barra de estado nativa lo ignora.)
+        _pintar(self.sb, fg=_T.dim)
         self.sb.SetStatusWidths([-3, -1, -3, -1, -1, -1, -2])
         self._actualizar_sb()
         self._set_conectado_ui(False)   # estado inicial: desconectado
 
     def _build_pagina_chat(self, parent) -> wx.Panel:
         pag = wx.Panel(parent, name="PaginaChat")
-        pag.SetBackgroundColour(_T.bg)
-        pag.SetForegroundColour(_T.text)
+        _pintar(pag, _T.bg, _T.text)
         vs = wx.BoxSizer(wx.VERTICAL)
 
         lbl = wx.StaticText(pag, label="Mensajes del chat:", name="EtiquetaChat")
@@ -869,8 +922,7 @@ class YTChatFrame(wx.Frame):
 
     def _build_pagina_info(self, parent) -> wx.Panel:
         pag = wx.Panel(parent, name="PaginaInfo")
-        pag.SetBackgroundColour(_T.bg)
-        pag.SetForegroundColour(_T.text)
+        _pintar(pag, _T.bg, _T.text)
         vs = wx.BoxSizer(wx.VERTICAL)
 
         lbl = wx.StaticText(pag, label="Información del vídeo:", name="EtiquetaInfo")
@@ -911,7 +963,9 @@ class YTChatFrame(wx.Frame):
     def _bind_events(self):
         self.Bind(wx.EVT_CLOSE, self._on_close)
         self.Bind(wx.EVT_ACTIVATE, self._on_activate)
-        self.Bind(wx.EVT_SIZE, self._on_resize)
+        # En el panel, no en el frame: cuando el frame recibe EVT_SIZE el panel
+        # aún tiene el tamaño viejo y cada Wrap iba un evento tarde.
+        self._panel_principal.Bind(wx.EVT_SIZE, self._on_resize)
         self.btn_conectar.Bind(wx.EVT_BUTTON, self._on_conectar)
         self.txt_url.Bind(wx.EVT_TEXT_ENTER,  self._on_conectar)
         self.nb.Bind(wx.EVT_NOTEBOOK_PAGE_CHANGED, self._on_nb_page)
@@ -934,8 +988,10 @@ class YTChatFrame(wx.Frame):
         event.Skip()
 
     def _on_resize(self, event):
-        event.Skip()
+        # Primero el Wrap y luego Skip: así el Layout por defecto del panel ya
+        # cuenta con la altura nueva de la etiqueta.
         self._ajustar_ancho_tipo()
+        event.Skip()
 
     def _ajustar_ancho_tipo(self) -> None:
         """Reajusta el salto de línea de lbl_tipo al ancho disponible: con
@@ -945,23 +1001,72 @@ class YTChatFrame(wx.Frame):
             return
         try:
             ancho = max(200, self.lbl_tipo.GetParent().GetClientSize().Width - 20)
+            # Wrap() solo parte: mete saltos de línea literales que GetLabel
+            # conserva, así que al ensanchar el texto se quedaba troceado. Se
+            # parte siempre desde el texto original.
+            self.lbl_tipo.SetLabel(self._texto_tipo)
             self.lbl_tipo.Wrap(ancho)
         except Exception:
             pass
 
     def _fijar_tipo(self, texto: str) -> None:
-        self.lbl_tipo.SetLabel(texto)
+        self._texto_tipo = texto
         self._ajustar_ancho_tipo()
+        try:    self._panel_principal.Layout()
+        except Exception: pass
+
+    def _ajustar_minimo_ventana(self) -> None:
+        """Piso real de la ventana: lo que pide el sizer (con el reproductor a
+        la vista ronda los 850 px de alto, muy por encima de 640×480, y el
+        vídeo quedaba cortado por abajo). Se limita a la pantalla y, si la
+        ventana era más chica, se agranda para que quepa todo."""
+        try:
+            minimo = self._panel_principal.GetSizer().GetMinSize()
+            area = wx.Display(self).GetClientArea()
+            # Descontar título, menú, barra de estado y bordes.
+            ancho = max(640, min(minimo.width, area.width - 40))
+            alto = max(480, min(minimo.height, area.height - 110))
+            self.SetMinClientSize((ancho, alto))
+            actual = self.GetClientSize()
+            if self.IsMaximized() or (actual.width >= ancho and actual.height >= alto):
+                return
+            self.SetClientSize((max(actual.width, ancho), max(actual.height, alto)))
+            rect = self.GetRect()
+            x = max(area.x, min(rect.x, area.right - rect.width))
+            y = max(area.y, min(rect.y, area.bottom - rect.height))
+            if (x, y) != (rect.x, rect.y):
+                self.Move((x, y))
+        except Exception as exc:
+            logger.debug("ajustar mínimo de la ventana: %s", exc)
 
     def _on_activate(self, event):
-        # Al volver el foco a la app, llevarlo al contenido (chat/comentarios);
-        # si aún no hay conexión, al campo de URL.
         if event.GetActive() and self._alive:
-            if self._conectado:
-                wx.CallAfter(self._foco_contenido)
-            else:
-                wx.CallAfter(self.txt_url.SetFocus)
+            # Diferido: wx repone el foco en el último control tras este evento.
+            wx.CallAfter(self._foco_al_activar)
         event.Skip()
+
+    def _foco_al_activar(self) -> None:
+        """Al volver a la app, llevar el foco al contenido (o a la URL si no hay
+        conexión) SOLO si no quedó ya en un control de la ventana: al cerrarse
+        un diálogo o un aviso, el usuario vuelve a donde estaba (reproductor,
+        redacción…) y no hay que arrastrarlo al chat."""
+        if not self._alive:
+            return
+        foco = wx.Window.FindFocus()
+        if foco is not None and self._es_descendiente(foco):
+            return
+        if self._conectado:
+            self._foco_contenido()
+        else:
+            self.txt_url.SetFocus()
+
+    def _es_descendiente(self, ventana) -> bool:
+        while ventana is not None:
+            if ventana is self:
+                return True
+            try:    ventana = ventana.GetParent()
+            except Exception: return False
+        return False
 
     def _init_timer(self):
         self._timer = wx.Timer(self)
@@ -1021,7 +1126,9 @@ class YTChatFrame(wx.Frame):
     def _ir_pestana(self, idx: int):
         """Selecciona una pestaña del notebook y deja el foco en su contenido."""
         if 0 <= idx < self.nb.GetPageCount():
-            self.nb.SetSelection(idx)
+            # ChangeSelection no dispara EVT_NOTEBOOK_PAGE_CHANGED (SetSelection
+            # sí): si no, _on_nb_page anunciaba la pestaña y aquí otra vez.
+            self.nb.ChangeSelection(idx)
             self._region_idx = REG_CONTENIDO
             self._foco_contenido()
             anunciar(self.nb.GetPageText(idx))
@@ -1092,14 +1199,20 @@ class YTChatFrame(wx.Frame):
             self._on_conectar(None)
 
     def _desconectar_si_procede(self):
-        if self._conectado:
+        if self._conectado or self._conectando:
             self._on_conectar(None)
 
     def _on_conectar(self, event):
-        if self._conectado:
+        if self._conectado or self._conectando:
+            # Desconectar o, si aún estaba «Conectando…», cancelar: el callback
+            # cierra la sesión y lo que devuelva ese hilo se descarta.
+            cancelando = not self._conectado
             if self.on_desconectar_cb:
                 self.on_desconectar_cb()
             self.set_conectado(False)
+            if cancelando:
+                anunciar("Conexión cancelada")
+                self.txt_url.SetFocus()
         else:
             url = self.txt_url.GetValue().strip()
             if not url:
@@ -1107,9 +1220,13 @@ class YTChatFrame(wx.Frame):
                               "Falta URL", wx.OK | wx.ICON_WARNING, self)
                 self.txt_url.SetFocus()
                 return
-            self.btn_conectar.SetLabel("Conectando...")
-            self.btn_conectar.Disable()
+            self._conectando = True
+            # El botón y «Desconectar» siguen activos para poder cancelar una
+            # conexión que no responde.
+            self.btn_conectar.SetLabel("&Cancelar conexión")
+            self.btn_conectar.Enable()
             self.mi_conectar.Enable(False)
+            self.mi_desconectar.Enable(True)
             self.txt_url.Disable()
             _snd.reproducir("conectando")
             anunciar("Conectando")
@@ -1162,7 +1279,7 @@ class YTChatFrame(wx.Frame):
                         gestor.cerrar()
                     except Exception:
                         pass
-            wx.CallAfter(anunciar, texto, "microfono")
+            wx.CallAfter(anunciar, texto)
 
         diagnostico.crear_hilo(_alternar, "MicrofonoObs").start()
 
@@ -1233,7 +1350,7 @@ class YTChatFrame(wx.Frame):
         # sincroniza la casilla del menú vía on_botones_toggle).
         try:
             self._rep_panel.set_botones_visibles(
-                bool(self._config.get("mostrar_botones_reproductor", False)))
+                bool(self._config.get("mostrar_botones_reproductor", True)))
         except Exception:
             pass
         self._actualizar_vigilante_obs()
@@ -1264,8 +1381,7 @@ class YTChatFrame(wx.Frame):
     def _on_pausa(self, event):
         self._worker.toggle_pausa()
         pausado = self._worker.esta_pausado()
-        self.mi_pausa.SetItemLabel(
-            ("&Reanudar lectura" if pausado else "&Pausar lectura") + self._accel("pausa"))
+        self._sincronizar_pausa()
         _snd.reproducir("pausa" if pausado else "reanudar")
         anunciar("Pausado" if pausado else "Reanudado")
 
@@ -1408,21 +1524,18 @@ class YTChatFrame(wx.Frame):
     # ── Enviar al chat del directo (API oficial) ─────────────────────────────
 
     def _on_enviar_live(self, event):
+        # Alt+Enter sin poder escribir (sin conexión, TikTok, sin sesión…): decir
+        # por qué en vez de callar; el motivo lo lleva el propio compositor.
+        motivo = self._panel_redactar.motivo()
+        if motivo:
+            anunciar(motivo)
+            return
         self._panel_redactar.enfocar()
 
     def _enviar_live_redactado(self, texto):
         lcid = self._live_chat_id
         self._accion_api(lambda cli: cli.enviar_mensaje_live(lcid, texto),
                          "Mensaje enviado al chat")
-
-    def _puede_escribir_live(self) -> bool:
-        if not (youtube_api.google_disponible() and credenciales.hay_sesion()):
-            anunciar("Inicia sesión en Configuración de API para usar esta función")
-            return False
-        if not self._live_chat_id:
-            anunciar("No hay un chat en vivo activo en este directo")
-            return False
-        return True
 
     def _accion_api(self, accion, mensaje_ok: str, sonido: str = "enviado") -> None:
         anunciar("Enviando")
@@ -1438,14 +1551,17 @@ class YTChatFrame(wx.Frame):
                 logger.warning("acción API: %s", exc)
                 wx.CallAfter(self._api_err, exc)
 
-        import threading
         diagnostico.crear_hilo(_run, "AccionAPI").start()
 
     def _api_ok(self, mensaje, sonido: str = "enviado"):
+        if not self:   # la ventana pudo cerrarse mientras respondía la API
+            return
         _snd.reproducir(sonido)
         anunciar(mensaje)
 
     def _api_err(self, exc):
+        if not self:
+            return
         _snd.reproducir("error")
         msg = youtube_api.mensaje_error_api(exc)
         anunciar(msg)
@@ -1540,14 +1656,6 @@ class YTChatFrame(wx.Frame):
             lambda cli: cli.banear_usuario(lcid, canal_id, segundos), ok,
             sonido="moderacion")
 
-    # ── Atajos sobre la lista de chat ────────────────────────────────────────
-
-    def _copiar_atajo(self):
-        if self.lb_chat.GetSelection() == wx.NOT_FOUND:
-            anunciar("Sin mensaje seleccionado")
-        else:
-            self._copiar_mensaje()
-
     # ── Chat: teclado, menú, copiar, silenciar ───────────────────────────────
 
     def _on_chat_key(self, event):
@@ -1561,7 +1669,10 @@ class YTChatFrame(wx.Frame):
             event.Skip()
 
     def _on_chat_char_hook(self, event):
-        if event.GetKeyCode() in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+        if (event.GetKeyCode() in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER)
+                and event.GetModifiers() == wx.MOD_NONE):
+            # Solo Enter a secas: Alt+Enter es el acelerador de «Enviar mensaje»
+            # y debe seguir hasta el menú.
             self._copiar_mensaje()
         else:
             event.Skip()
@@ -1724,10 +1835,6 @@ class YTChatFrame(wx.Frame):
     def _autor_esta_oculto(self, autor: str) -> bool:
         return autor.lower().strip() in self._config.get("silenciados_ocultar", set())
 
-    def _autor_seleccionado(self) -> str | None:
-        data = self._get_selected_data()
-        return data.autor if data else None
-
     # ── Selección y portapapeles ─────────────────────────────────────────────
 
     def _get_selected_data(self):
@@ -1749,6 +1856,8 @@ class YTChatFrame(wx.Frame):
         self._diagnostico_parada.set()
         self._actualizar_vigilante_obs_cierre()
         try:    self._timer.Stop()
+        except Exception: pass
+        try:    self._diagnostico_timer.Stop()
         except Exception: pass
         if self._pendientes_timer is not None:
             try:    self._pendientes_timer.Stop()
@@ -1958,6 +2067,7 @@ class YTChatFrame(wx.Frame):
         comentarios, reproductor, cola de lectura, super chats y contadores. NO
         toca las preferencias del usuario (filtro, voz, sonidos, tema)."""
         self._live_chat_id = ""
+        self._video_id_sesion = ""
         self._causa_sin_chat = ""
         self._tipo_video = deteccion.DESCONOCIDO
         self._es_tiktok = False
@@ -1992,6 +2102,7 @@ class YTChatFrame(wx.Frame):
     def _mostrar_zona(self, mostrar: bool) -> None:
         self._zona.Show(mostrar)
         self._panel_principal.Layout()
+        self._ajustar_minimo_ventana()
 
     def _anunciar_conectado(self) -> None:
         t = self._tipo_video
@@ -2005,8 +2116,14 @@ class YTChatFrame(wx.Frame):
             msg = "Conectado."
         anunciar(msg)
 
-    def set_live_chat_id(self, live_chat_id: str, causa: str = "") -> None:
+    def set_live_chat_id(self, live_chat_id: str, causa: str = "",
+                         video_id: str | None = None) -> None:
         if not self._alive:
+            return
+        if video_id is not None and video_id != self._video_id_sesion:
+            # Respuesta tardía del hilo LiveChatId de una conexión anterior:
+            # con ese id el compositor y los mensajes programados escribirían
+            # en el chat del directo equivocado.
             return
         self._live_chat_id = live_chat_id or ""
         self._causa_sin_chat = causa or ""
@@ -2029,6 +2146,7 @@ class YTChatFrame(wx.Frame):
         if not self._alive:
             return
         self._tipo_video = tipo
+        self._video_id_sesion = video_id or ""
         self._es_tiktok = False   # esta ruta es la de YouTube
         # Empezar el chat en limpio en cada conexión: el reset al desconectar ya
         # lo hace, pero así garantizamos que nunca quede nada del vídeo anterior.
@@ -2046,15 +2164,17 @@ class YTChatFrame(wx.Frame):
         try:    self._rep_panel.set_video(video_id, autoplay=autoplay)
         except Exception: pass
 
+        # ChangeSelection: sin anuncio de pestaña; el de «conectado» que viene
+        # después ya dice qué hay disponible.
         if tipo == deteccion.LIVE:
             self._fijar_tipo("Directo en vivo: leyendo el chat.")
-            self.nb.SetSelection(PAG_CHAT)
+            self.nb.ChangeSelection(PAG_CHAT)
         elif tipo == deteccion.UPCOMING:
             self._fijar_tipo("Directo programado: aún sin chat. Hay comentarios.")
-            self.nb.SetSelection(PAG_COMENTARIOS)
+            self.nb.ChangeSelection(PAG_COMENTARIOS)
         elif tipo == deteccion.VOD:
             self._fijar_tipo("Vídeo subido: comentarios y reproductor.")
-            self.nb.SetSelection(PAG_COMENTARIOS)
+            self.nb.ChangeSelection(PAG_COMENTARIOS)
         else:
             self._fijar_tipo("Tipo no determinado: intentando leer el chat.")
 
@@ -2078,7 +2198,7 @@ class YTChatFrame(wx.Frame):
         try:    self._rep_panel.set_flujo(url_flujo, autoplay=autoplay)
         except Exception as exc: logger.debug("reproductor tiktok: %s", exc)
         self._fijar_tipo(f"Directo de TikTok de @{usuario}: leyendo el chat.")
-        self.nb.SetSelection(PAG_CHAT)
+        self.nb.ChangeSelection(PAG_CHAT)
 
     def set_url(self, url: str) -> None:
         self.txt_url.SetValue(url)
@@ -2197,6 +2317,7 @@ class YTChatFrame(wx.Frame):
     def _set_conectado_ui(self, conectado: bool) -> None:
         # Botón (toggle), items de menú Conectar/Desconectar y campo URL. El
         # resto (ocultar zona, sonido, título) lo gestiona set_conectado.
+        self._conectando = False
         self.btn_conectar.SetLabel("&Desconectar" if conectado else "&Conectar")
         self.btn_conectar.Enable()
         self.mi_conectar.Enable(not conectado)

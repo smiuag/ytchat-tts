@@ -91,6 +91,61 @@ class TestComentariosPanel(unittest.TestCase):
         self.panel.set_video("video", autocargar=False)
         self.assertFalse(self.panel._comentarios_cerrados)
 
+    def _comentario(self, texto, identificador):
+        return youtube_api.Comentario("Ana", texto, 0, "", 0, identificador, "canal")
+
+    def test_la_pagina_de_un_video_anterior_se_descarta(self):
+        # Una carga en curso del vídeo anterior que llega tarde no debe
+        # aterrizar en el nuevo ni dejar «Cargar más» paginando el viejo.
+        self.panel.set_video("viejo", autocargar=False)
+        generacion_vieja = self.panel._generacion
+        self.panel.set_video("nuevo", autocargar=False)
+        self.panel._pagina_ok([self._comentario("del viejo", "c1")], "token-viejo",
+                              generacion_vieja)
+        self.assertEqual(self.panel.lb.GetCount(), 0)
+        self.assertEqual(self.panel._next_token, "")
+        self.assertFalse(self.panel.btn_mas.IsEnabled())
+
+    def test_el_error_de_un_video_anterior_se_ignora(self):
+        self.panel.set_video("viejo", autocargar=False)
+        generacion_vieja = self.panel._generacion
+        self.panel.set_video("nuevo", autocargar=False)
+        self.panel._pagina_err(Exception("commentsDisabled"), generacion_vieja)
+        self.assertFalse(self.panel._comentarios_cerrados)
+        gui_comentarios.anunciar.assert_not_called()
+
+    def test_la_pagina_del_video_vigente_si_se_muestra(self):
+        self.panel.set_video("nuevo", autocargar=False)
+        self.panel._pagina_ok([self._comentario("hola", "c1")], "mas",
+                              self.panel._generacion)
+        self.assertEqual(self.panel.lb.GetCount(), 1)
+        self.assertEqual(self.panel._next_token, "mas")
+        self.assertTrue(self.panel.btn_mas.IsEnabled())
+
+    def test_cambiar_de_video_olvida_la_carga_en_curso(self):
+        self.panel.set_video("viejo", autocargar=False)
+        self.panel._cargando = True
+        self.panel.btn_recargar.Disable()
+        self.panel.set_video("nuevo", autocargar=False)
+        self.assertFalse(self.panel._cargando)
+        self.assertTrue(self.panel.btn_recargar.IsEnabled())
+        self.panel.limpiar()
+        self.assertEqual(self.panel._video_id, "")
+
+    def test_la_carga_lleva_la_generacion_a_la_respuesta(self):
+        self.panel.set_video("video", autocargar=False)
+        cliente = mock.Mock(leer_comentarios=mock.Mock(return_value=([], "")))
+        diferidos = []
+        with mock.patch.object(gui_comentarios.credenciales, "hay_lectura", return_value=True), \
+                mock.patch.object(self.panel, "_cliente", return_value=cliente), \
+                mock.patch.object(gui_comentarios.diagnostico, "crear_hilo",
+                                  side_effect=lambda objetivo, nombre: mock.Mock(start=objetivo)), \
+                mock.patch.object(gui_comentarios.wx, "CallAfter",
+                                  side_effect=lambda fn, *args: diferidos.append((fn, args))):
+            self.panel._cargar_pagina("")
+        self.assertEqual(diferidos, [(self.panel._pagina_ok, ([], "", self.panel._generacion))])
+        gui_comentarios.anunciar.assert_called_once_with("Cargando comentarios", urgente=False)
+
     def test_aplicar_orden_recarga_pero_elegir_no(self):
         self.panel._recargar = mock.Mock()
         evento = wx.CommandEvent(wx.EVT_CHOICE.typeId, self.panel.cho_orden.GetId())

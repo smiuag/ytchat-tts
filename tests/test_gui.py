@@ -215,6 +215,27 @@ class TestInicioGui(unittest.TestCase):
 
         diferir.assert_called_once_with(manejador, "primero", 2, True)
 
+    def test_reconstruir_el_menu_destruye_el_anterior_y_conserva_reanudar(self):
+        # Preferencias reconstruye la barra: la vieja se destruye y el ítem de
+        # pausa sale con el estado real de la lectura, no siempre «Pausar».
+        frame = mock.Mock()
+        frame._accel.return_value = ""
+        frame._worker.esta_pausado.return_value = True
+        with mock.patch.object(gui.wx, "Menu"), \
+                mock.patch.object(gui.wx, "MenuBar"):
+            gui.YTChatFrame._build_menubar(frame)
+
+        frame.GetMenuBar.return_value.Destroy.assert_called_once_with()
+        frame._sincronizar_pausa.assert_called_once_with()
+        gui.YTChatFrame._sincronizar_pausa(frame)
+        frame.mi_pausa.SetItemLabel.assert_called_once_with("&Reanudar lectura")
+
+    def test_sincronizar_pausa_sin_worker_no_revienta(self):
+        frame = mock.Mock()
+        frame._worker.esta_pausado.side_effect = AttributeError
+        gui.YTChatFrame._sincronizar_pausa(frame)
+        frame.mi_pausa.SetItemLabel.assert_not_called()
+
     def test_contador_accesible_selecciona_todo_al_recibir_el_foco(self):
         contador = mock.Mock()
         contador.GetTextValue.return_value = "123"
@@ -227,18 +248,40 @@ class TestInicioGui(unittest.TestCase):
 
 
 class EventoTecladoFalso:
-    def __init__(self, codigo):
+    def __init__(self, codigo, modificadores=0):
         self.codigo = codigo
+        self.modificadores = modificadores
         self.omitido = False
 
     def GetKeyCode(self):
         return self.codigo
+
+    def GetModifiers(self):
+        return self.modificadores
 
     def Skip(self):
         self.omitido = True
 
 
 class TestEnterEnListas(unittest.TestCase):
+
+    def test_chat_alt_enter_se_deja_pasar_al_acelerador(self):
+        # Alt+Enter es el acelerador de «Enviar mensaje»: no debe copiar.
+        frame = gui.YTChatFrame.__new__(gui.YTChatFrame)
+        frame._copiar_mensaje = mock.Mock()
+        evento = EventoTecladoFalso(gui.wx.WXK_RETURN, gui.wx.MOD_ALT)
+        frame._on_chat_char_hook(evento)
+        frame._copiar_mensaje.assert_not_called()
+        self.assertTrue(evento.omitido)
+
+    def test_comentarios_alt_enter_se_deja_pasar_al_acelerador(self):
+        panel = gui_comentarios.ComentariosPanel.__new__(
+            gui_comentarios.ComentariosPanel)
+        panel._leer = mock.Mock()
+        evento = EventoTecladoFalso(gui_comentarios.wx.WXK_RETURN, gui_comentarios.wx.MOD_ALT)
+        panel._on_char_hook(evento)
+        panel._leer.assert_not_called()
+        self.assertTrue(evento.omitido)
 
     def test_chat_enlaza_el_gancho_de_caracteres(self):
         frame = gui.YTChatFrame.__new__(gui.YTChatFrame)
@@ -322,11 +365,12 @@ class TestComentariosPanel(unittest.TestCase):
         panel.set_video("unvideo", autocargar=True)
         hay_lectura.return_value = True
         cliente = mock.Mock(leer_comentarios=mock.Mock(return_value=([], "")))
-        def hilo_inmediato(*args, **kwargs):
-            return mock.Mock(start=lambda: kwargs["target"]())
+        def hilo_inmediato(objetivo, nombre):
+            return mock.Mock(start=objetivo)
 
         with mock.patch.object(panel, "_cliente", return_value=cliente), \
-                mock.patch.object(gui_comentarios.threading, "Thread", side_effect=hilo_inmediato):
+                mock.patch.object(gui_comentarios.diagnostico, "crear_hilo",
+                                  side_effect=hilo_inmediato):
             panel._recargar()
         cliente.leer_comentarios.assert_called_once_with("unvideo", page_token="", orden="relevance")
 
@@ -395,6 +439,18 @@ class TestRegistroEsAnunciable(unittest.TestCase):
             gui.anunciar("hola", urgente=False)
 
         self.assertEqual(grabador.interrupciones, [False])
+
+    def test_anunciar_desde_otro_hilo_se_reenvia_al_hilo_principal(self):
+        # La voz va por COM: desde un hilo ajeno no se habla, se difiere.
+        grabador = GrabadorDeVoz()
+        with mock.patch.object(gui, "_ao2", grabador), \
+                mock.patch.object(gui.wx, "IsMainThread", return_value=False), \
+                mock.patch.object(gui.wx, "CallAfter") as diferir:
+            gui.anunciar("hola", urgente=False)
+
+        diferir.assert_called_once_with(gui.anunciar, "hola", False)
+        self.assertEqual(grabador.hablado, [])
+        self.assertEqual(grabador.brailleado, [])
 
     def test_anunciar_envia_braille_en_los_dos_casos(self):
         grabador = GrabadorDeVoz()
@@ -469,6 +525,251 @@ class TestRegistroEsAnunciable(unittest.TestCase):
         warn.assert_any_call("wx: %s", "fallo error")
         warn.assert_any_call("wx: %s", "aviso")
         dbg.assert_any_call("wx: %s", "mensaje")
+
+
+class TestAltoContraste(unittest.TestCase):
+    """Con un tema de alto contraste de Windows la paleta propia no se aplica:
+    esos colores los eligió el usuario precisamente para poder ver."""
+
+    def test_sin_alto_contraste_se_pinta_la_paleta(self):
+        control = mock.Mock()
+        with mock.patch.object(gui, "ALTO_CONTRASTE", False):
+            gui._tc(control)
+        control.SetBackgroundColour.assert_called_once_with(gui._T.field)
+        control.SetForegroundColour.assert_called_once_with(gui._T.text)
+
+    def test_con_alto_contraste_no_se_toca_ningun_color(self):
+        control = mock.Mock()
+        with mock.patch.object(gui, "ALTO_CONTRASTE", True):
+            gui._tc(control)
+            gui._pintar(control, gui._T.bg, gui._T.text)
+            gui._titulo(control)
+        control.SetBackgroundColour.assert_not_called()
+        control.SetForegroundColour.assert_not_called()
+        control.SetFont.assert_called_once()   # la negrita de sección sí queda
+
+    def test_pintar_solo_aplica_lo_que_se_le_pasa(self):
+        control = mock.Mock()
+        with mock.patch.object(gui, "ALTO_CONTRASTE", False):
+            gui._pintar(control, fg=gui._T.dim)
+        control.SetBackgroundColour.assert_not_called()
+        control.SetForegroundColour.assert_called_once_with(gui._T.dim)
+
+    def test_la_deteccion_nunca_revienta(self):
+        self.assertIn(gui._detectar_alto_contraste(), (True, False))
+
+
+class TestVentanaReal(unittest.TestCase):
+    """Comprobaciones que necesitan la ventana de verdad (tamaños, Wrap)."""
+
+    def setUp(self):
+        self.app = gui.wx.App(False) if not gui.wx.App.Get() else gui.wx.App.Get()
+
+    def _ventana(self, **worker_extra):
+        configuracion = {
+            "atajos_raw": {}, "filtro_activo": "todos",
+            "mostrar_botones_reproductor": False, "mostrar_metadatos": True,
+            "mostrar_total_superchats": True, "overlay_activo": False,
+            "programados_activo": False,
+        }
+        from types import SimpleNamespace
+        stats = SimpleNamespace(leidos=0, superchats=0, descartados=0)
+        worker = SimpleNamespace(get_rate=lambda: 0, get_volume=lambda: 100, **worker_extra)
+        with mock.patch.object(gui.diagnostico, "crear_hilo"):
+            frame = gui.YTChatFrame(None, configuracion, queue.Queue(), stats, worker,
+                                    __import__("threading").Event())
+        self.addCleanup(frame.Destroy)
+        frame.Show()
+        gui.wx.Yield()
+        return frame
+
+    @staticmethod
+    def _saltos(frame):
+        return frame.lbl_tipo.GetLabel().count("\n")
+
+    def test_el_texto_de_tipo_se_vuelve_a_ensanchar(self):
+        # Wrap() solo parte; al agrandar la ventana el texto debe volver a
+        # una línea y no quedarse troceado con los saltos de la ventana chica.
+        frame = self._ventana()
+        frame.SetSize((650, 700)); gui.wx.Yield()
+        self.assertGreater(self._saltos(frame), 0)
+        frame.SetSize((1500, 700)); gui.wx.Yield()
+        self.assertEqual(self._saltos(frame), 0)
+        self.assertEqual(frame.lbl_tipo.GetLabel(), gui.MENSAJE_INICIAL)
+
+    def test_el_wrap_usa_el_ancho_actual_y_no_el_anterior(self):
+        frame = self._ventana()
+        frame.SetSize((1500, 700)); gui.wx.Yield()
+        frame.SetSize((650, 700)); gui.wx.Yield()
+        ancho_panel = frame._panel_principal.GetClientSize().width
+        self.assertLessEqual(frame.lbl_tipo.GetBestSize().width, ancho_panel - 20)
+
+    def test_fijar_tipo_conserva_el_texto_original(self):
+        frame = self._ventana()
+        frame.SetSize((650, 700)); gui.wx.Yield()
+        frame._fijar_tipo("Directo programado: aún sin chat. Hay comentarios.")
+        frame.SetSize((1500, 700)); gui.wx.Yield()
+        self.assertEqual(frame.lbl_tipo.GetLabel(),
+                         "Directo programado: aún sin chat. Hay comentarios.")
+
+    def test_con_el_reproductor_a_la_vista_el_piso_sale_del_sizer(self):
+        frame = self._ventana()
+        self.assertLess(frame.GetMinClientSize().height, 500)
+        frame._mostrar_zona(True)
+        minimo = frame._panel_principal.GetSizer().GetMinSize()
+        area = gui.wx.Display(frame).GetClientArea()
+        esperado = max(480, min(minimo.height, area.height - 110))
+        self.assertGreater(esperado, 500)
+        self.assertAlmostEqual(frame.GetMinClientSize().height, esperado, delta=4)
+        # La ventana se agrandó para que quepa todo (o ya cabía).
+        self.assertGreaterEqual(frame.GetClientSize().height, esperado - 4)
+
+    def test_el_piso_no_sigue_al_ancho_de_la_ventana(self):
+        # La etiqueta sin partir no debe empujar el mínimo hasta el ancho actual.
+        frame = self._ventana()
+        frame.SetSize((1500, 700)); gui.wx.Yield()
+        frame._mostrar_zona(True)
+        self.assertLess(frame.GetMinClientSize().width, 1000)
+
+    def test_reconstruir_el_menu_destruye_la_barra_anterior(self):
+        frame = self._ventana(esta_pausado=lambda: True)
+        anterior = frame.GetMenuBar()
+        frame._build_menubar()
+        self.assertIsNot(frame.GetMenuBar(), anterior)
+        self.assertFalse(bool(anterior))
+        self.assertEqual(frame.mi_pausa.GetItemLabelText(), "Reanudar lectura")
+
+
+class TestFocoAlActivar(unittest.TestCase):
+    """Al activarse la ventana no se roba el foco si ya está en un control
+    suyo (p. ej. al cerrarse un aviso mientras se estaba en el reproductor)."""
+
+    def _frame(self, conectado=True):
+        frame = gui.YTChatFrame.__new__(gui.YTChatFrame)
+        frame._alive = True
+        frame._conectado = conectado
+        frame._foco_contenido = mock.Mock()
+        frame.txt_url = mock.Mock()
+        return frame
+
+    def _control_dentro_de(self, frame):
+        padre = mock.Mock()
+        padre.GetParent.return_value = None
+        # La cadena de padres llega al frame: el control es suyo.
+        control = mock.Mock()
+        control.GetParent.return_value = frame
+        return control
+
+    def test_no_mueve_el_foco_si_ya_esta_dentro_de_la_ventana(self):
+        frame = self._frame()
+        with mock.patch.object(gui.wx.Window, "FindFocus",
+                               return_value=self._control_dentro_de(frame)):
+            frame._foco_al_activar()
+        frame._foco_contenido.assert_not_called()
+        frame.txt_url.SetFocus.assert_not_called()
+
+    def test_sin_foco_va_al_contenido_si_hay_conexion(self):
+        frame = self._frame()
+        with mock.patch.object(gui.wx.Window, "FindFocus", return_value=None):
+            frame._foco_al_activar()
+        frame._foco_contenido.assert_called_once_with()
+
+    def test_foco_fuera_de_la_ventana_va_a_la_url_sin_conexion(self):
+        frame = self._frame(conectado=False)
+        ajeno = mock.Mock()
+        ajeno.GetParent.return_value = None
+        with mock.patch.object(gui.wx.Window, "FindFocus", return_value=ajeno):
+            frame._foco_al_activar()
+        frame.txt_url.SetFocus.assert_called_once_with()
+
+    def test_on_activate_difiere_la_decision(self):
+        frame = self._frame()
+        frame._foco_al_activar = mock.Mock()
+        evento = mock.Mock()
+        evento.GetActive.return_value = True
+        with mock.patch.object(gui.wx, "CallAfter") as diferir:
+            frame._on_activate(evento)
+        diferir.assert_called_once_with(frame._foco_al_activar)
+        evento.Skip.assert_called_once_with()
+
+
+class TestConexionCancelable(unittest.TestCase):
+
+    def _frame(self):
+        frame = gui.YTChatFrame.__new__(gui.YTChatFrame)
+        frame._conectado = False
+        frame._conectando = False
+        frame.txt_url = mock.Mock()
+        frame.txt_url.GetValue.return_value = "abcdefghijk"
+        frame.btn_conectar = mock.Mock()
+        frame.mi_conectar = mock.Mock()
+        frame.mi_desconectar = mock.Mock()
+        frame.on_conectar_cb = mock.Mock()
+        frame.on_desconectar_cb = mock.Mock()
+        frame.set_conectado = mock.Mock()
+        return frame
+
+    def test_mientras_conecta_desconectar_sigue_disponible(self):
+        frame = self._frame()
+        with mock.patch.object(gui._snd, "reproducir"), \
+                mock.patch.object(gui, "anunciar"):
+            frame._on_conectar(None)
+        self.assertTrue(frame._conectando)
+        frame.mi_desconectar.Enable.assert_called_once_with(True)
+        frame.btn_conectar.Enable.assert_called_once_with()
+        frame.btn_conectar.Disable.assert_not_called()
+        frame.on_conectar_cb.assert_called_once_with("abcdefghijk")
+
+    def test_desconectar_durante_la_conexion_la_cancela(self):
+        frame = self._frame()
+        with mock.patch.object(gui._snd, "reproducir"), \
+                mock.patch.object(gui, "anunciar") as anunciar:
+            frame._on_conectar(None)
+            frame._desconectar_si_procede()
+        frame.on_desconectar_cb.assert_called_once_with()
+        frame.set_conectado.assert_called_once_with(False)
+        anunciar.assert_called_with("Conexión cancelada")
+        frame.txt_url.SetFocus.assert_called_once_with()
+
+    def test_sin_conexion_ni_intento_desconectar_no_hace_nada(self):
+        frame = self._frame()
+        frame._desconectar_si_procede()
+        frame.on_desconectar_cb.assert_not_called()
+
+    def test_la_respuesta_de_conexion_apaga_el_estado_conectando(self):
+        frame = self._frame()
+        frame._conectando = True
+        frame._actualizar_menus_por_conexion = mock.Mock()
+        gui.YTChatFrame._set_conectado_ui(frame, True)
+        self.assertFalse(frame._conectando)
+
+    def test_alt_enter_sin_poder_escribir_anuncia_el_motivo(self):
+        frame = gui.YTChatFrame.__new__(gui.YTChatFrame)
+        frame._panel_redactar = mock.Mock()
+        frame._panel_redactar.motivo.return_value = "Conéctate a un directo para escribir en el chat"
+        with mock.patch.object(gui, "anunciar") as anunciar:
+            frame._on_enviar_live(None)
+        anunciar.assert_called_once_with("Conéctate a un directo para escribir en el chat")
+        frame._panel_redactar.enfocar.assert_not_called()
+
+    def test_alt_enter_con_chat_disponible_enfoca_el_compositor(self):
+        frame = gui.YTChatFrame.__new__(gui.YTChatFrame)
+        frame._panel_redactar = mock.Mock()
+        frame._panel_redactar.motivo.return_value = ""
+        with mock.patch.object(gui, "anunciar") as anunciar:
+            frame._on_enviar_live(None)
+        anunciar.assert_not_called()
+        frame._panel_redactar.enfocar.assert_called_once_with()
+
+    def test_respuesta_de_la_api_con_la_ventana_destruida_se_ignora(self):
+        # Un frame sin construir se comporta como uno ya destruido (bool False).
+        frame = gui.YTChatFrame.__new__(gui.YTChatFrame)
+        with mock.patch.object(gui._snd, "reproducir") as sonar, \
+                mock.patch.object(gui, "anunciar") as anunciar:
+            frame._api_ok("Mensaje enviado al chat")
+            frame._api_err(RuntimeError("x"))
+        sonar.assert_not_called()
+        anunciar.assert_not_called()
 
 
 class _BarraDeMenu:
@@ -981,6 +1282,46 @@ class TestCategoriasDePreferencias(unittest.TestCase):
         hilo.start.assert_called_once_with()
         gestor.conectar.assert_called_once_with()
 
+    def test_las_paginas_se_desplazan_en_vertical(self):
+        # Atajos mide más de 1200 px: sin desplazamiento, sus botones de
+        # abajo (y «Restablecer») quedaban fuera del alcance del ratón.
+        dialogo = self._dialogo()
+        for pagina in dialogo._paginas():
+            with self.subTest(pagina=pagina.GetName()):
+                self.assertIsInstance(pagina, gui.wx.ScrolledWindow)
+                self.assertEqual(pagina.GetScrollPixelsPerUnit(), (0, 20))
+
+    def test_cada_pagina_cabe_a_lo_ancho(self):
+        # No hay desplazamiento horizontal: lo que no quepa a lo ancho se corta.
+        dialogo = self._dialogo()
+        barra = gui.wx.SystemSettings.GetMetric(gui.wx.SYS_VSCROLL_X)
+        for pagina in dialogo._paginas():
+            with self.subTest(pagina=pagina.GetName()):
+                visible = pagina.GetClientSize().width
+                self.assertGreater(visible, 100)
+                self.assertLessEqual(pagina.GetSizer().GetMinSize().width, visible - barra)
+
+    def test_el_dialogo_se_puede_agrandar_pero_no_por_debajo_de_las_paginas(self):
+        dialogo = self._dialogo()
+        self.assertTrue(dialogo.GetWindowStyleFlag() & gui.wx.RESIZE_BORDER)
+        necesario = max(p.GetSizer().GetMinSize().width for p in dialogo._paginas())
+        self.assertGreater(dialogo.GetMinSize().width, necesario)
+        self.assertGreaterEqual(dialogo.GetSize().width, dialogo.GetMinSize().width)
+
+    def test_respuestas_de_hilos_ignoran_el_dialogo_destruido(self):
+        dialogo = self._dialogo()
+        with mock.patch.object(gui_preferencias.PreferenciasDialog, "__bool__",
+                               lambda self: False, create=True), \
+                mock.patch.object(gui_preferencias, "anunciar") as anunciar, \
+                mock.patch.object(gui_preferencias._snd, "reproducir") as sonar, \
+                mock.patch.object(gui_preferencias.wx, "MessageBox") as aviso:
+            dialogo._microfonos_encontrados(("Mic/Aux",))
+            dialogo._api_login_ok()
+            dialogo._api_login_err(RuntimeError("x"))
+        anunciar.assert_not_called()
+        sonar.assert_not_called()
+        aviso.assert_not_called()
+
     def test_guardar_escribe_las_mismas_claves(self):
         dialogo = self._dialogo()
         with mock.patch.object(gui_preferencias.cfg, "guardar_opcion") as guardar, \
@@ -1104,6 +1445,27 @@ class TestGuardadoDeNuevasPreferencias(unittest.TestCase):
                 estrategia = self._opciones_guardadas().get("cola", "estrategia")
                 self.assertEqual(estrategia, clave)
                 self.assertNotEqual(estrategia, etiqueta)
+
+    def test_cambiar_el_puerto_con_el_panel_encendido_avisa_donde_se_aplica(self):
+        dialogo = self._dialogo({"overlay_activo": True, "overlay_puerto": 8730})
+        dialogo.sp_puerto_overlay.SetValue(9000)
+
+        anunciar = self._guardar(dialogo)
+
+        anunciar.assert_any_call(
+            "El puerto nuevo del panel de chat se aplica al apagarlo y "
+            "volver a encenderlo desde el panel de transmisión")
+
+    def test_el_puerto_sin_cambios_o_con_el_panel_apagado_no_avisa(self):
+        for configuracion, puerto in (
+                ({"overlay_activo": True, "overlay_puerto": 8730}, 8730),
+                ({"overlay_activo": False, "overlay_puerto": 8730}, 9000)):
+            with self.subTest(configuracion=configuracion, puerto=puerto):
+                dialogo = self._dialogo(dict(configuracion))
+                dialogo.sp_puerto_overlay.SetValue(puerto)
+                anunciar = self._guardar(dialogo)
+                self.assertEqual([llamada.args[0] for llamada in anunciar.call_args_list],
+                                 ["Preferencias guardadas"])
 
     def test_microfono_automatico_se_guarda_vacio(self):
         dialogo = self._dialogo({"obs_microfono": "Mic/Aux"})
@@ -1344,6 +1706,51 @@ class TestDescartesGui(unittest.TestCase):
         self.assertEqual(avisos.count(gui.descartes.frase_aviso(0)), 2)
 
 
+class TestLiveChatIdPorSesion(unittest.TestCase):
+    """El id del chat en vivo llega de un hilo que puede terminar tarde: si
+    es de una conexión anterior, aceptarlo mandaría los mensajes programados
+    y el compositor al directo equivocado."""
+
+    def _frame(self, video_actual):
+        frame = gui.YTChatFrame.__new__(gui.YTChatFrame)
+        frame.__dict__.update(_alive=True, _video_id_sesion=video_actual,
+                              _live_chat_id="", _causa_sin_chat="")
+        frame._actualizar_estado_online = mock.Mock()
+        return frame
+
+    def test_acepta_el_id_del_video_vigente(self):
+        frame = self._frame("abc")
+        frame.set_live_chat_id("chat-abc", "", video_id="abc")
+        self.assertEqual(frame._live_chat_id, "chat-abc")
+        frame._actualizar_estado_online.assert_called_once()
+
+    def test_ignora_el_id_de_un_video_anterior(self):
+        frame = self._frame("nuevo")
+        frame.set_live_chat_id("chat-viejo", "", video_id="viejo")
+        self.assertEqual(frame._live_chat_id, "")
+        frame._actualizar_estado_online.assert_not_called()
+
+    def test_sin_video_id_conserva_el_comportamiento_anterior(self):
+        frame = self._frame("abc")
+        frame.set_live_chat_id("chat", "causa")
+        self.assertEqual((frame._live_chat_id, frame._causa_sin_chat), ("chat", "causa"))
+
+    def test_set_tipo_video_fija_el_video_de_la_sesion(self):
+        frame = gui.YTChatFrame.__new__(gui.YTChatFrame)
+        frame.__dict__.update(_alive=True, _video_id_sesion="", _config={},
+                              _sc_totales={}, _tipo_video=gui.deteccion.DESCONOCIDO,
+                              _es_tiktok=False)
+        for nombre in ("_descartar_pendientes", "_chat", "lb_chat", "_com_panel",
+                       "_rep_panel", "_fijar_tipo", "_actualizar_estado_online",
+                       "_actualizar_titulo"):
+            setattr(frame, nombre, mock.Mock())
+        try:
+            frame.set_tipo_video(gui.deteccion.LIVE, "abc")
+        except Exception:
+            pass  # el resto del método toca controles que aquí no existen
+        self.assertEqual(frame._video_id_sesion, "abc")
+
+
 class TestEstadoObsEnF2(unittest.TestCase):
     def _frame(self, toggles, vigilante=None):
         frame = gui.YTChatFrame.__new__(gui.YTChatFrame)
@@ -1361,7 +1768,7 @@ class TestEstadoObsEnF2(unittest.TestCase):
         with mock.patch.object(gui, "anunciar") as anunciar:
             frame._anunciar_estado()
         texto = anunciar.call_args.args[0]
-        self.assertTrue(all(x in texto for x in ("Transmitiendo desde hace 1 min, 2 fotogramas perdidos",
+        self.assertTrue(all(x in texto for x in ("Transmitiendo desde hace 1 min, 2 de 10 fotogramas perdidos",
                                                    "Grabando, 00:01:00", "Al aire: Principal")))
     def test_f2_omite_dato_pasado_y_sin_vigilante(self):
         for toggles, vigilante in (({"estado", *gui._OBS_COMPONENTES}, mock.Mock(estado=lambda: None)),
@@ -1602,6 +2009,7 @@ class TestCierreVentana(unittest.TestCase):
         frame._apagando = False
         frame._alive = True
         frame._timer = mock.Mock()
+        frame._diagnostico_timer = mock.Mock()
         frame._pendientes_timer = None
         frame.on_desconectar_cb = None
         frame._parada = mock.Mock()
@@ -1653,6 +2061,16 @@ class TestCierreVentana(unittest.TestCase):
             frame._on_close(None)
 
         frame._diagnostico_parada.set.assert_called_once_with()
+
+    def test_al_cerrar_para_los_dos_temporizadores(self):
+        frame = self._frame()
+        with mock.patch.object(gui.diagnostico, "hilos_vivos_de_la_aplicacion", return_value=()), \
+                mock.patch.object(gui, "anunciar"), \
+                mock.patch.object(gui.diagnostico.logger, "info"):
+            frame._on_close(None)
+
+        frame._timer.Stop.assert_called_once_with()
+        frame._diagnostico_timer.Stop.assert_called_once_with()
 
     def test_encender_el_overlay_con_el_puerto_ocupado_no_persiste_ni_miente(self):
         frame = self._frame()

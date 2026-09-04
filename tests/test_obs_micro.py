@@ -35,7 +35,7 @@ class AccionMicrofonoObsTest(unittest.TestCase):
         gestor.alternar_silencio.assert_called_once_with("Audio USB")
         gestor.cerrar.assert_called_once_with()
         crear.assert_called_once()
-        self.assertEqual(anuncios, [("Audio USB silenciado", "microfono")])
+        self.assertEqual(anuncios, [("Audio USB silenciado",)])
 
     def test_obs_caido_anuncia_como_activar_el_servidor(self):
         gestor = mock.Mock()
@@ -44,7 +44,7 @@ class AccionMicrofonoObsTest(unittest.TestCase):
         gestor.cerrar.assert_called_once_with()
         self.assertEqual(anuncios, [(
             "OBS no responde. En OBS, menú Herramientas, Configuración del servidor "
-            "WebSocket, activa el servidor.", "microfono")])
+            "WebSocket, activa el servidor.",)])
 
 
 if __name__ == "__main__":

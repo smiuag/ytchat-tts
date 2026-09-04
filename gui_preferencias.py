@@ -50,6 +50,11 @@ def _tc(w, bg=None, fg=None):
 
 URL_GUIA = "https://github.com/miguel-cinsfran/ytchat-tts/blob/main/docs/CONFIGURACION_API.md"
 
+# Ancho al que se parten las notas de cada página. Con 560 desbordaban el área
+# visible (unos 490 px) y no hay desplazamiento horizontal.
+ANCHO_NOTA = 450
+TAMANO_DIALOGO = (720, 600)
+
 _FORMATOS = [
     ("Nombre y mensaje", "nombre_mensaje"),
     ("Mensaje y después el nombre", "mensaje_nombre"),
@@ -102,7 +107,10 @@ def _combo_a_texto(mods: int, keycode: int) -> str | None:
 class PreferenciasDialog(wx.Dialog):
 
     def __init__(self, parent, config: dict):
-        super().__init__(parent, title="Preferencias", size=(620, 560),
+        # Redimensionable: quien ve poco puede agrandarlo; las páginas se
+        # desplazan solas si no caben.
+        super().__init__(parent, title="Preferencias", size=TAMANO_DIALOGO,
+                         style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER,
                          name="DialogoPreferencias")
         self._config = config
         self._ruta = cfg.app_dir() / "config.ini"
@@ -111,6 +119,7 @@ class PreferenciasDialog(wx.Dialog):
         self._cambios = False
         self.SetBackgroundColour(_T.bg)
         self._build_ui()
+        self._ajustar_minimo()
         self.Centre()
 
     # ── UI ───────────────────────────────────────────────────────────────────
@@ -139,6 +148,10 @@ class PreferenciasDialog(wx.Dialog):
         self.nb.AddPage(self._pag_programados(self.nb), "Mensajes automáticos")
         self.nb.AddPage(self._pag_transmision(self.nb), "Transmisión")
         self.nb.AddPage(self._pag_diagnostico(self.nb), "Diagnóstico")
+        # Mínimo explícito: si no, el libro pide el «mejor tamaño» de la página
+        # más alta (Atajos, más de 1200 px) y el sizer lo desbordaría en vez
+        # de dejar que la página se desplace.
+        self.nb.SetMinSize((320, 240))
         vs.Add(self.nb, 1, wx.EXPAND | wx.ALL, 10)
 
         row = wx.BoxSizer(wx.HORIZONTAL)
@@ -155,10 +168,35 @@ class PreferenciasDialog(wx.Dialog):
         self.lista_categorias.SetFocus()
 
     def _make_panel(self, parent, name):
-        p = wx.Panel(parent, name=name)
+        # Página desplazable (solo vertical): la de Atajos mide más de 1200 px
+        # y en un wx.Panel fijo dos tercios de sus botones quedaban fuera del
+        # alcance del ratón. El foco (Tab) desplaza solo hasta el control.
+        p = wx.ScrolledWindow(parent, name=name, style=wx.TAB_TRAVERSAL | wx.VSCROLL)
+        p.SetScrollRate(0, 20)
         p.SetBackgroundColour(_T.bg)
         p.SetForegroundColour(_T.text)
         return p
+
+    def _paginas(self):
+        return [self.nb.GetPage(i) for i in range(self.nb.GetPageCount())]
+
+    def _ajustar_minimo(self):
+        """Ancho mínimo del diálogo: el que deja a la página más ancha entera
+        (más la barra de desplazamiento). No hay desplazamiento horizontal,
+        así que más angosto se cortarían controles."""
+        try:
+            self.Layout()
+            visible = self.nb.GetPage(0).GetClientSize().width
+            necesario = max(p.GetSizer().GetMinSize().width for p in self._paginas())
+            barra = wx.SystemSettings.GetMetric(wx.SYS_VSCROLL_X)
+            ancho = self.GetSize().width - visible + necesario + barra
+            alto = 480
+            self.SetMinSize((ancho, alto))
+            actual = self.GetSize()
+            if actual.width < ancho or actual.height < alto:
+                self.SetSize((max(actual.width, ancho), max(actual.height, alto)))
+        except Exception as exc:
+            logger.debug("mínimo del diálogo de preferencias: %s", exc)
 
     def _pag_interfaz(self, parent):
         p = self._make_panel(parent, "PagInterfaz")
@@ -327,6 +365,8 @@ class PreferenciasDialog(wx.Dialog):
         diagnostico.crear_hilo(consultar, "MicrofonosPrefs").start()
 
     def _microfonos_encontrados(self, fuentes):
+        if not self:   # el diálogo pudo cerrarse mientras OBS respondía
+            return
         elegido = self.cho_microfono_obs.GetStringSelection()
         opciones = ["Elegir automáticamente"]
         # La fuente guardada se conserva aunque OBS no responda o ya no la vea.
@@ -366,7 +406,7 @@ class PreferenciasDialog(wx.Dialog):
         self.chk_botones_rep = wx.CheckBox(p, label="Mostrar los &botones del reproductor (también con su interruptor y el menú Reproductor)",
                                            name="MostrarBotonesReproductor")
         self.chk_botones_rep.SetForegroundColour(_T.text)
-        self.chk_botones_rep.SetValue(bool(self._config.get("mostrar_botones_reproductor", False)))
+        self.chk_botones_rep.SetValue(bool(self._config.get("mostrar_botones_reproductor", True)))
         vs.Add(self.chk_botones_rep, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
 
         etiqueta_cache = wx.StaticText(
@@ -487,7 +527,7 @@ class PreferenciasDialog(wx.Dialog):
             "oír; por defecto, los datos del vídeo y del chat. El orden en que se "
             "dice es fijo."))
         nota.SetForegroundColour(_T.dim)
-        nota.Wrap(560)
+        nota.Wrap(ANCHO_NOTA)
         vs.Add(nota, 0, wx.ALL, 10)
 
         activos = self._config.get("estado_toggles") or estado_sesion.ACTIVOS_DEFECTO
@@ -528,7 +568,7 @@ class PreferenciasDialog(wx.Dialog):
             "palabras o de esos usuarios. Se aplican a partir del próximo mensaje."),
             name="NotaFiltros")
         nota.SetForegroundColour(_T.dim)
-        nota.Wrap(560)
+        nota.Wrap(ANCHO_NOTA)
         vs.Add(nota, 0, wx.ALL, 10)
 
         p.SetSizer(vs)
@@ -546,7 +586,7 @@ class PreferenciasDialog(wx.Dialog):
             "Las fijas se muestran para que no se puedan pisar."),
             name="NotaAtajos")
         nota.SetForegroundColour(_T.dim)
-        nota.Wrap(560)
+        nota.Wrap(ANCHO_NOTA)
         vs.Add(nota, 0, wx.ALL, 10)
 
         # Valores normalizados en memoria (lo que se edita y se guarda).
@@ -672,7 +712,7 @@ class PreferenciasDialog(wx.Dialog):
             "OAuth e iniciar sesión permiten MODERAR el chat, enviar mensajes al "
             "directo y publicar o responder comentarios."))
         intro.SetForegroundColour(_T.dim)
-        intro.Wrap(560)
+        intro.Wrap(ANCHO_NOTA)
         vs.Add(intro, 0, wx.ALL, 10)
 
         if not youtube_api.google_disponible():
@@ -731,7 +771,7 @@ class PreferenciasDialog(wx.Dialog):
             "YouTube suele bloquear los enlaces en el chat en vivo: conviene "
             "escribir el nombre de usuario en vez de la dirección completa."))
         intro.SetForegroundColour(_T.dim)
-        intro.Wrap(560)
+        intro.Wrap(ANCHO_NOTA)
         vs.Add(intro, 0, wx.ALL, 10)
 
         self.chk_programados = wx.CheckBox(
@@ -911,6 +951,8 @@ class PreferenciasDialog(wx.Dialog):
         diagnostico.crear_hilo(_run, "OAuthLogin").start()
 
     def _api_login_ok(self):
+        if not self:   # el diálogo pudo cerrarse mientras se autorizaba
+            return
         self._login_en_curso = False
         self.btn_api_login.Enable()
         _snd.reproducir("conectado")
@@ -918,6 +960,8 @@ class PreferenciasDialog(wx.Dialog):
         self._api_refrescar_estado()
 
     def _api_login_err(self, exc):
+        if not self:
+            return
         self._login_en_curso = False
         self.btn_api_login.Enable()
         _snd.reproducir("error")
@@ -1040,6 +1084,7 @@ class PreferenciasDialog(wx.Dialog):
         self._set("diagnostico", "registro_detallado",
                   "true" if registro_detallado else "false")
         c["registro_detallado"] = registro_detallado
+        puerto_anterior = int(c.get("overlay_puerto", 8730))
         puerto_overlay = int(self.sp_puerto_overlay.GetValue())
         self._set("overlay", "puerto", str(puerto_overlay))
         c["overlay_puerto"] = puerto_overlay
@@ -1077,6 +1122,11 @@ class PreferenciasDialog(wx.Dialog):
         anunciar("Preferencias guardadas")
         if registro_detallado != registro_detallado_inicial:
             anunciar("El cambio del registro detallado se aplica al reiniciar la aplicación")
+        # El servidor del panel ya escucha en el puerto viejo; no se reinicia
+        # solo, así que se avisa dónde se aplica.
+        if puerto_overlay != puerto_anterior and c.get("overlay_activo", False):
+            anunciar("El puerto nuevo del panel de chat se aplica al apagarlo y "
+                     "volver a encenderlo desde el panel de transmisión")
         self.EndModal(wx.ID_OK)
 
     def hubo_cambios(self) -> bool:
