@@ -14,6 +14,10 @@ class FrasesObsTest(unittest.TestCase):
 
     def test_transmision_activa_con_fotogramas_perdidos(self):
         self.assertEqual(obs_estado.frase_transmision(True, 3_600, 4, 100),
+                         "Transmitiendo desde hace 1 h 0 min, 4 de 100 fotogramas perdidos")
+
+    def test_fotogramas_perdidos_sin_total_omite_la_proporcion(self):
+        self.assertEqual(obs_estado.frase_transmision(True, 3_600, 4, 0),
                          "Transmitiendo desde hace 1 h 0 min, 4 fotogramas perdidos")
 
     def test_grabacion_inactiva(self):

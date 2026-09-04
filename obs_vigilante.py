@@ -75,6 +75,10 @@ class VigilanteObs:
                         logger.info("OBS volvió a responder")
                         fallo = False
                 except Exception:
+                    if self._parada.is_set():
+                        # Al cerrar la app la petición en vuelo se cancela; ese
+                        # aviso se anuncia en voz alta y OBS no tiene la culpa.
+                        break
                     if not fallo:
                         logger.warning("OBS no responde; se reintentará")
                         fallo = True

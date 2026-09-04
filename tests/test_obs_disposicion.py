@@ -41,11 +41,8 @@ class GeometriaTest(unittest.TestCase):
                                  lienzo_ancho=1600, lienzo_alto=900)
         self.assertEqual(obs.describir(snap, ("posicion",)),
                          "A 5% del borde izquierdo y a 3% del borde inferior.")
-        """
-                         "Posición: izquierda 5%, inferior 3%")
 
     def test_posicion_fuera_por_la_izquierda(self):
-        """
         snap = obs.SnapshotPanel(conectado=True, izquierda=-300, arriba=262,
                                  ancho=460, alto=620, lienzo_ancho=1600,
                                  lienzo_alto=900)
@@ -58,10 +55,6 @@ class GeometriaTest(unittest.TestCase):
                                  lienzo_alto=900)
         self.assertEqual(obs.describir(snap, ("posicion",)),
                          "Se sale del lienzo por la derecha, y a 2% del borde inferior.")
-        """
-                         "Posición: izquierda 5%, inferior 3%")
-
-        """
 
     def test_posicion_fuera_por_arriba(self):
         snap = obs.SnapshotPanel(conectado=True, izquierda=32, arriba=-200,
@@ -175,15 +168,14 @@ class GeometriaTest(unittest.TestCase):
         self.assertEqual(obs.describir(obs.SnapshotPanel(), ("tamano",)), "")
 
     def test_varios_solapes(self):
-        return
-        snap = obs.SnapshotPanel(solapes=(("Cámara", 12.4), ("Juego", 4.1)))
-        self.assertEqual(obs.describir(snap, ("solape",)), "Cámara 12%, Juego 4%.")
-
-    def test_varios_solapes_conectado(self):
         snap = obs.SnapshotPanel(conectado=True,
-                                 solapes=(("C\u00c3\u00a1mara", 12.4), ("Juego", 4.1)))
+                                 solapes=(("Cámara", 12.4), ("Juego", 4.1)))
         self.assertEqual(obs.describir(snap, ("solape",)),
-                         "Superpone al 12% de C\u00c3\u00a1mara y al 4% de Juego.")
+                         "Superpone al 12% de Cámara y al 4% de Juego.")
+
+    def test_varios_solapes_sin_conexion_no_se_describen(self):
+        snap = obs.SnapshotPanel(solapes=(("Cámara", 12.4), ("Juego", 4.1)))
+        self.assertEqual(obs.describir(snap, ("solape",)), "")
 
     def test_aspecto_parcial(self):
         snap = obs.SnapshotPanel(conectado=True, tamano_letra=18)
@@ -248,9 +240,6 @@ class DescripcionTest(unittest.TestCase):
                               lienzo_ancho=1600, lienzo_alto=900, visible=False,
                               bloqueada=True, tapada_por="Cámara", solapes=(("Cámara", 12.4),),
                               fuera=12.4, mensajes_visibles=14, tamano_letra=18)
-        """
-        self.assertEqual(obs.describir(s, ("conexion",)), "Sin conexión con OBS.")
-        """
         self.assertEqual(obs.describir(s, ("escena",)), "Juego.")
         self.assertEqual(obs.describir(s, ("tamano",)), "460 por 620, 29% del ancho.")
         self.assertEqual(obs.describir(s, ("capa",)), "Lo tapa Cámara.")
@@ -296,11 +285,7 @@ class DescripcionTest(unittest.TestCase):
         self.assertEqual(obs.describir(s, obs.COMPONENTES, "largo"), esperado)
         self.assertEqual(obs.describir(obs.SnapshotPanel(), ("transparencia",), "corto"), "")
         self.assertEqual(obs.describir(obs.SnapshotPanel(), ("transparencia",), "largo"), "")
-        """
-                         "El fondo del panel es transparente. Solo se ven las tarjetas de los mensajes, apiladas contra el borde inferior.")
 
-
-        """
 
 if __name__ == "__main__":
     unittest.main()

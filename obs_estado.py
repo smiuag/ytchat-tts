@@ -9,7 +9,10 @@ def frase_transmision(activa, segundos, perdidos, totales) -> str:
         return "No estás transmitiendo"
     frase = f"Transmitiendo desde hace {_duracion(int(segundos))}"
     if perdidos:
-        frase += f", {int(perdidos)} fotogramas perdidos"
+        # El total da la medida: 4 fotogramas de 100 es un problema; de
+        # 100 000, no.
+        de_cuantos = f" de {int(totales)}" if totales else ""
+        frase += f", {int(perdidos)}{de_cuantos} fotogramas perdidos"
     return frase
 
 

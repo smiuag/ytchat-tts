@@ -4,7 +4,9 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
+from unittest import mock
 
 import obs_cliente
 
@@ -156,7 +158,68 @@ class ClienteObsTest(unittest.TestCase):
         cliente = self.cliente(transporte)
         cliente.conectar()
         self.assertTrue(cliente.conectado)
-        self.assertEqual(transporte.enviados[0], {"op": 1, "d": {"rpcVersion": 1}})
+        self.assertEqual(transporte.enviados[0],
+                         {"op": 1, "d": {"rpcVersion": 1, "eventSubscriptions": 0}})
+
+    def test_conectar_de_nuevo_cierra_el_transporte_anterior(self):
+        def transporte_nuevo():
+            return TransporteDoble([
+                json.dumps({"op": 0, "d": {"rpcVersion": 1}}),
+                json.dumps({"op": 2, "d": {}}),
+            ])
+        transportes = [transporte_nuevo(), transporte_nuevo()]
+        cliente = obs_cliente.ClienteObs(
+            obs_cliente.AjustesObs(True, 4455, ""),
+            lambda uri: transportes.pop(0))
+        cliente.conectar()
+        primero = cliente._transporte
+        cliente.conectar()
+        self.assertTrue(primero.cerrado)
+        self.assertIsNot(cliente._transporte, primero)
+        self.assertTrue(cliente.conectado)
+
+    def test_obs_cierra_la_conexion_y_el_cliente_deja_de_estar_conectado(self):
+        from websockets.exceptions import ConnectionClosed
+        transporte = TransporteDoble([])
+        transporte.recv = mock.Mock(side_effect=ConnectionClosed(None, None))
+        cliente = self.cliente(transporte)
+        cliente._transporte = transporte
+        with self.assertRaisesRegex(obs_cliente.ObsError, "Se perdió la conexión"):
+            cliente.pedir("GetVersion")
+        self.assertFalse(cliente.conectado)
+        self.assertTrue(transporte.cerrado)
+
+    def test_peticiones_concurrentes_no_se_pisan(self):
+        # Sin cerrojo, dos hilos hacían send/recv a la vez sobre el mismo socket.
+        class TransporteLento(TransporteDoble):
+            def __init__(self):
+                super().__init__([])
+                self.ocupado = False
+                self.solapes = 0
+
+            def send(self, mensaje):
+                if self.ocupado:
+                    self.solapes += 1
+                self.ocupado = True
+                time.sleep(0.01)
+                super().send(mensaje)
+
+            def recv(self, timeout=None):
+                mensaje = super().recv(timeout)
+                self.ocupado = False
+                return mensaje
+
+        transporte = TransporteLento()
+        cliente = self.cliente(transporte)
+        cliente._transporte = transporte
+        hilos = [threading.Thread(target=cliente.pedir, args=("GetVersion",))
+                 for _ in range(4)]
+        for hilo in hilos:
+            hilo.start()
+        for hilo in hilos:
+            hilo.join(2)
+        self.assertEqual(transporte.solapes, 0)
+        self.assertEqual(len(transporte.enviados), 4)
 
     def test_conectar_con_autenticacion(self):
         transporte = TransporteDoble([

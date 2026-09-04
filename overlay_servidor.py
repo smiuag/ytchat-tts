@@ -4,11 +4,14 @@ from collections import deque
 import http.server
 import json
 import queue
+import secrets
 import threading
 
 import config
 
 INTERVALO_LATIDO = 15
+# Eventos que un espectador puede dejar sin leer antes de que se le corte.
+TOPE_COLA = 64
 
 
 class OverlayPuertoOcupadoError(RuntimeError):
@@ -53,9 +56,12 @@ class _Manejador(http.server.BaseHTTPRequestHandler):
 
     def _eventos(self):
         propietario = self.server.propietario
-        canal = queue.Queue()
+        canal = queue.Queue(maxsize=TOPE_COLA)
+        # Al reconectar en menos de diez segundos la página conserva lo
+        # pintado; repetirle el anillo entero duplicaba mensajes.
+        ultimo = ultimo_id_visto(self.headers.get("Last-Event-ID"), propietario._epoca)
         with propietario._bloqueo:
-            anillo = list(propietario._anillo)
+            anillo = [par for par in propietario._anillo if par[0] > ultimo]
             propietario._clientes.add(canal)
         try:
             self.send_response(200)
@@ -63,18 +69,18 @@ class _Manejador(http.server.BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "keep-alive")
             self.end_headers()
-            for evento in anillo:
-                self._enviar(evento)
+            for numero, evento in anillo:
+                self._enviar(numero, evento)
             while not propietario._detener.is_set():
                 try:
-                    evento = canal.get(timeout=INTERVALO_LATIDO)
+                    par = canal.get(timeout=INTERVALO_LATIDO)
                 except queue.Empty:
                     self.wfile.write(b": latido\n\n")
                     self.wfile.flush()
                     continue
-                if evento is None:
+                if par is None:
                     break
-                self._enviar(evento)
+                self._enviar(*par)
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
         finally:
@@ -83,10 +89,31 @@ class _Manejador(http.server.BaseHTTPRequestHandler):
             # El navegador necesita EOF para detectar que el panel se apagó.
             self.close_connection = True
 
-    def _enviar(self, evento):
+    def _enviar(self, numero, evento):
         datos = json.dumps(evento, ensure_ascii=False, separators=(",", ":"))
-        self.wfile.write(("data: " + datos + "\n\n").encode("utf-8"))
+        identificador = f"{self.server.propietario._epoca}-{numero}"
+        self.wfile.write((f"id: {identificador}\ndata: " + datos + "\n\n").encode("utf-8"))
         self.wfile.flush()
+
+
+def ultimo_id_visto(cabecera, epoca) -> int:
+    """Número del último evento que el espectador ya pintó, o 0."""
+    # La época distingue esta ejecución de otra anterior: tras reiniciar la
+    # aplicación la numeración vuelve a empezar y el anillo entero es nuevo.
+    prefijo = f"{epoca}-"
+    if not cabecera or not cabecera.startswith(prefijo):
+        return 0
+    try:
+        return int(cabecera[len(prefijo):])
+    except ValueError:
+        return 0
+
+
+def _cortar(canal):
+    """Vacía la cola de un espectador y le manda el fin de flujo."""
+    with canal.mutex:
+        canal.queue.clear()
+    canal.put_nowait(None)
 
 
 class OverlayServidor:
@@ -94,6 +121,8 @@ class OverlayServidor:
         self.puerto = puerto
         self.pagina = pagina if pagina is not None else _leer_pagina()
         self._anillo = deque(maxlen=30)
+        self._epoca = secrets.token_hex(4)
+        self._contador = 0
         self._clientes = set()
         self._bloqueo = threading.Lock()
         self._detener = threading.Event()
@@ -123,7 +152,7 @@ class OverlayServidor:
         with self._bloqueo:
             clientes = list(self._clientes)
         for canal in clientes:
-            canal.put(None)
+            _cortar(canal)
         servidor.shutdown()
         hilo.join(timeout=5)
         servidor.server_close()
@@ -132,10 +161,18 @@ class OverlayServidor:
 
     def difundir(self, evento):
         with self._bloqueo:
-            self._anillo.append(evento)
+            self._contador += 1
+            par = (self._contador, evento)
+            self._anillo.append(par)
             clientes = list(self._clientes)
         for canal in clientes:
-            canal.put(evento)
+            try:
+                canal.put_nowait(par)
+            except queue.Full:
+                # Un espectador que no drena su cola no puede retener memoria
+                # sin tope: se le corta y su navegador reconecta con
+                # Last-Event-ID, que le da lo que se perdió.
+                _cortar(canal)
 
     def estado(self):
         with self._bloqueo:

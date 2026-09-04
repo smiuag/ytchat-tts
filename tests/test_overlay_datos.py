@@ -25,6 +25,17 @@ class OverlayDatosTests(unittest.TestCase):
         self.assertEqual(inicial_de("  "), "?")
         self.assertEqual(inicial_de("álex"), "Á")
 
+    def test_paridad_con_la_pagina_por_puntos_de_codigo(self):
+        # chat.html recorre Array.from(nombre) y codePointAt: un emoji cuenta
+        # como un solo carácter en los dos lados. Valores calculados a mano
+        # con FNV-1a sobre puntos de código; si cambian, cambió el contrato.
+        self.assertEqual(inicial_de("😀 hola"), "😀")
+        h = 2166136261
+        for caracter in "a😀":
+            h = ((h ^ ord(caracter)) * 16777619) & 0xFFFFFFFF
+        h ^= h >> 13
+        self.assertEqual(color_de_nombre("a😀"), PALETA_NOMBRES[h % len(PALETA_NOMBRES)])
+
     def test_evento_tiene_las_claves_exactas(self):
         evento = evento_de_mensaje("Ana", "Hola", "tiktok", "100")
         self.assertEqual(set(evento), {"autor", "texto", "plataforma", "monto"})

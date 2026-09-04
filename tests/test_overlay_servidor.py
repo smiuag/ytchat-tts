@@ -1,4 +1,5 @@
 import json
+import queue
 import socket
 import threading
 import time
@@ -6,7 +7,7 @@ import unittest
 import io
 import tempfile
 from pathlib import Path
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 from unittest import mock
 
 from overlay_datos import evento_de_mensaje
@@ -139,6 +140,81 @@ class OverlayServidorTests(unittest.TestCase):
         texto = "<img src=x onerror=HACKEADO>"
         self.servidor.difundir(evento_de_mensaje("autor", texto, "youtube"))
         self.assertEqual(len(self.servidor._anillo), 1)
+
+    def test_cada_evento_lleva_un_id_creciente(self):
+        respuesta = urlopen(self.base + "/eventos", timeout=3)
+        try:
+            esperar_clientes(self.servidor)
+            self.servidor.difundir(evento_de_mensaje("Ana", "uno", "youtube"))
+            self.servidor.difundir(evento_de_mensaje("Ana", "dos", "youtube"))
+            epoca = self.servidor._epoca
+            self.assertEqual(respuesta.readline(), f"id: {epoca}-1\n".encode())
+            self.assertTrue(respuesta.readline().startswith(b"data: "))
+            self.assertEqual(respuesta.readline(), b"\n")
+            self.assertEqual(respuesta.readline(), f"id: {epoca}-2\n".encode())
+        finally:
+            respuesta.close()
+
+    def test_reconexion_con_last_event_id_solo_recibe_lo_nuevo(self):
+        eventos = [evento_de_mensaje(str(i), "texto", "youtube") for i in range(3)]
+        for evento in eventos:
+            self.servidor.difundir(evento)
+        peticion = Request(self.base + "/eventos",
+                           headers={"Last-Event-ID": f"{self.servidor._epoca}-2"})
+        respuesta = urlopen(peticion, timeout=3)
+        try:
+            esperar_clientes(self.servidor)
+            self.assertEqual(leer_evento(respuesta), eventos[2])
+            nuevo = evento_de_mensaje("Ana", "vivo", "youtube")
+            self.servidor.difundir(nuevo)
+            self.assertEqual(leer_evento(respuesta), nuevo)
+        finally:
+            respuesta.close()
+
+    def test_last_event_id_de_otra_ejecucion_reenvia_el_anillo_entero(self):
+        eventos = [evento_de_mensaje(str(i), "texto", "youtube") for i in range(3)]
+        for evento in eventos:
+            self.servidor.difundir(evento)
+        for cabecera in ("otra-2", "basura", f"{self.servidor._epoca}-x"):
+            with self.subTest(cabecera=cabecera):
+                peticion = Request(self.base + "/eventos",
+                                   headers={"Last-Event-ID": cabecera})
+                respuesta = urlopen(peticion, timeout=3)
+                try:
+                    self.assertEqual(leer_evento(respuesta), eventos[0])
+                finally:
+                    respuesta.close()
+
+    def test_ultimo_id_visto(self):
+        self.assertEqual(overlay_servidor.ultimo_id_visto("abcd-12", "abcd"), 12)
+        self.assertEqual(overlay_servidor.ultimo_id_visto("otra-12", "abcd"), 0)
+        self.assertEqual(overlay_servidor.ultimo_id_visto(None, "abcd"), 0)
+        self.assertEqual(overlay_servidor.ultimo_id_visto("abcd-", "abcd"), 0)
+
+    def test_un_cliente_que_no_drena_su_cola_se_corta(self):
+        canal = queue.Queue(maxsize=2)
+        with self.servidor._bloqueo:
+            self.servidor._clientes.add(canal)
+        try:
+            for i in range(3):
+                self.servidor.difundir(evento_de_mensaje("Ana", str(i), "youtube"))
+            self.assertIsNone(canal.get_nowait())
+            self.assertTrue(canal.empty())
+        finally:
+            with self.servidor._bloqueo:
+                self.servidor._clientes.discard(canal)
+
+    def test_la_cola_de_cada_cliente_tiene_tope(self):
+        original = overlay_servidor.TOPE_COLA
+        overlay_servidor.TOPE_COLA = 5
+        respuesta = urlopen(self.base + "/eventos", timeout=3)
+        try:
+            esperar_clientes(self.servidor)
+            canal = next(iter(self.servidor._clientes))
+            self.assertEqual(canal.maxsize, 5)
+        finally:
+            overlay_servidor.TOPE_COLA = original
+            respuesta.close()
 
     def test_latido_despues_de_silencio(self):
         original = overlay_servidor.INTERVALO_LATIDO

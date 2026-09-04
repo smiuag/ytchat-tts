@@ -98,18 +98,22 @@ var TOPE_EN_PANTALLA = 14;   // más que esto no se ve, y el DOM no crece sin fi
 // FNV-1a con una vuelta de mezcla al final. El clasico h*31 agrupa demasiado
 // con nombres cortos: medido sobre 300 nombres, se desviaba 11 del reparto
 // ideal contra 7 de este. Se nota, porque media sala termina del mismo color.
+// Se recorre por puntos de código, no por unidades UTF-16: overlay_datos.py
+// usa ord() y con un emoji en el nombre los dos lados daban colores distintos.
 function colorDe(nombre) {
   var h = 2166136261;
-  for (var i = 0; i < nombre.length; i++) {
-    h = Math.imul(h ^ nombre.charCodeAt(i), 16777619);
+  var puntos = Array.from(nombre);
+  for (var i = 0; i < puntos.length; i++) {
+    h = Math.imul(h ^ puntos[i].codePointAt(0), 16777619);
   }
   h = (h ^ (h >>> 13)) >>> 0;
   return PALETA[h % PALETA.length];
 }
 
 function inicialDe(nombre) {
-  var limpio = (nombre || "?").trim();
-  return limpio ? limpio[0].toUpperCase() : "?";
+  // limpio[0] parte un emoji por la mitad; Array.from respeta el par sustituto.
+  var puntos = Array.from((nombre || "?").trim());
+  return puntos.length ? puntos[0].toUpperCase() : "?";
 }
 
 // Todo el texto entra con textContent. NUNCA con innerHTML: el autor y el
@@ -166,7 +170,18 @@ fuente.onerror = function () {
     temporizadorCaida = undefined;
   }, 10000);
 };
+// El servidor numera los eventos y al reconectar ya filtra por Last-Event-ID;
+// esto es el cinturón por si el navegador reconecta sin mandar la cabecera.
+var idsVistos = [];
+function yaPintado(id) {
+  if (!id) { return false; }
+  if (idsVistos.indexOf(id) !== -1) { return true; }
+  idsVistos.push(id);
+  if (idsVistos.length > 60) { idsVistos.shift(); }
+  return false;
+}
 fuente.onmessage = function (e) {
+  if (yaPintado(e.lastEventId)) { return; }
   try { pintar(JSON.parse(e.data)); } catch (err) { /* un evento roto no tumba el resto */ }
 };
 </script>

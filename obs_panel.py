@@ -68,8 +68,16 @@ class GestorPanelObs:
 
     def estado_transmision(self, parada=None) -> dict:
         datos = self._pedir("GetStreamStatus", parada=parada)
-        return {clave: datos.get(clave, 0) for clave in (
+        estado = {clave: datos.get(clave, 0) for clave in (
             "outputActive", "outputDuration", "outputSkippedFrames", "outputTotalFrames")}
+        # obs-websocket da outputDuration en milisegundos; el resto de la app
+        # (obs_estado.frase_transmision, F2) lo trata en segundos. Sin esta
+        # conversión un minuto de directo se anunciaba como «16 h 40 min».
+        try:
+            estado["outputDuration"] = int(float(estado["outputDuration"]) / 1000)
+        except (TypeError, ValueError):
+            estado["outputDuration"] = 0
+        return estado
 
     def estado_grabacion(self, parada=None) -> dict:
         datos = self._pedir("GetRecordStatus", parada=parada)
@@ -93,15 +101,45 @@ class GestorPanelObs:
         return next((elemento for elemento in self._elementos(escena, parada)
                      if elemento.get("sourceName") == fuente), None)
 
+    def _elemento_obligatorio(self, escena, fuente, parada=None):
+        elemento = self._elemento(escena, fuente, parada)
+        if elemento is None:
+            # La fuente pudo borrarse o renombrarse en OBS desde la última
+            # lectura; antes esto acababa en un TypeError sin explicación.
+            raise obs_cliente.ObsError(obs_cliente.mensaje_de_fallo_obs("not found"))
+        return elemento
+
+    def _elemento_en_grupo(self, escena, fuente, parada=None):
+        # GetSceneItemList no baja a los grupos: si el usuario agrupó el panel,
+        # sin esta búsqueda se creaba un segundo elemento en la escena.
+        for elemento in self._elementos(escena, parada):
+            if not elemento.get("isGroup"):
+                continue
+            datos = self._pedir("GetGroupSceneItemList",
+                                {"sceneName": elemento.get("sourceName", "")}, parada)
+            hijo = next((hijo for hijo in datos.get("sceneItems", ())
+                         if hijo.get("sourceName") == fuente), None)
+            if hijo is not None:
+                return hijo
+        return None
+
     def asegurar_fuente(self, escena, url, ancho, alto, parada=None) -> int:
         elemento = self._elemento(escena, NOMBRE_FUENTE, parada)
+        if elemento is None:
+            elemento = self._elemento_en_grupo(escena, NOMBRE_FUENTE, parada)
         if elemento is not None:
             identificador = elemento["sceneItemId"]
         else:
             entradas = self._pedir("GetInputList", parada=parada).get("inputs", ())
-            existe = any(entrada.get("inputName") == NOMBRE_FUENTE
-                         for entrada in entradas)
-            if existe:
+            entrada = next((entrada for entrada in entradas
+                            if entrada.get("inputName") == NOMBRE_FUENTE), None)
+            if entrada is not None and entrada.get("inputKind", TIPO_FUENTE) != TIPO_FUENTE:
+                # Reutilizar una fuente ajena con el mismo nombre la rompería
+                # al escribirle la URL del panel.
+                raise obs_cliente.ObsError(
+                    f"Ya existe en OBS una fuente llamada «{NOMBRE_FUENTE}» que no es "
+                    "un navegador. Cámbiale el nombre en OBS.")
+            if entrada is not None:
                 datos = self._pedir(
                     "CreateSceneItem", {"sceneName": escena,
                                         "sourceName": NOMBRE_FUENTE}, parada)
@@ -142,7 +180,7 @@ class GestorPanelObs:
                 for clave in ("positionX", "positionY", "alignment")}
 
     def posicionar(self, escena, x, y, alineacion, parada=None, *, fuente=NOMBRE_FUENTE) -> None:
-        elemento = self._elemento(escena, fuente, parada)
+        elemento = self._elemento_obligatorio(escena, fuente, parada)
         # OBS rechaza boundsWidth y boundsHeight en cero al recibir una transformación.
         transformacion = {"positionX": x, "positionY": y,
                           "alignment": alineacion}
@@ -152,7 +190,7 @@ class GestorPanelObs:
         }, parada)
 
     def mover(self, escena, dx, dy, parada=None, *, fuente=NOMBRE_FUENTE) -> None:
-        elemento = self._elemento(escena, fuente, parada)
+        elemento = self._elemento_obligatorio(escena, fuente, parada)
         transformacion_actual = elemento["sceneItemTransform"]
         transformacion = {
             "positionX": transformacion_actual["positionX"] + dx,
@@ -164,7 +202,8 @@ class GestorPanelObs:
         }, parada)
 
     def redimensionar(self, escena, ancho, alto, parada=None) -> None:
-        self._elemento(escena, NOMBRE_FUENTE, parada)
+        # El tamaño vive en la entrada, no en el elemento de la escena; si la
+        # entrada no existe, OBS ya contesta 600 y se traduce solo.
         ajustes = self._pedir("GetInputSettings", {
             "inputName": NOMBRE_FUENTE,
         }, parada).get("inputSettings", {})
@@ -175,7 +214,7 @@ class GestorPanelObs:
         }, parada)
 
     def escalar(self, escena, ancho, alto, parada=None, *, fuente=NOMBRE_FUENTE) -> bool:
-        elemento = self._elemento(escena, fuente, parada)
+        elemento = self._elemento_obligatorio(escena, fuente, parada)
         transformacion_actual = elemento["sceneItemTransform"]
         escala = obs_disposicion.escala_para(
             ancho, alto, transformacion_actual.get("sourceWidth", 0),
@@ -189,19 +228,18 @@ class GestorPanelObs:
         return True
 
     def mostrar(self, escena, visible, parada=None, *, fuente=NOMBRE_FUENTE) -> None:
-        elemento = self._elemento(escena, fuente, parada)
+        elemento = self._elemento_obligatorio(escena, fuente, parada)
         self._pedir("SetSceneItemEnabled", {
             "sceneName": escena, "sceneItemId": elemento["sceneItemId"],
             "sceneItemEnabled": visible,
         }, parada)
 
     def fijar(self, escena, fijada, parada=None, *, fuente=NOMBRE_FUENTE) -> None:
-        elemento = self._elemento(escena, fuente, parada)
+        elemento = self._elemento_obligatorio(escena, fuente, parada)
         self._pedir("SetSceneItemLocked", {
             "sceneName": escena, "sceneItemId": elemento["sceneItemId"],
             "sceneItemLocked": fijada,
         }, parada)
-        self._elemento(escena, fuente, parada)
 
     def al_frente(self, escena, parada=None, *, fuente=NOMBRE_FUENTE) -> None:
         elementos = self._elementos(escena, parada)
@@ -217,7 +255,6 @@ class GestorPanelObs:
             "sceneName": escena, "sceneItemId": elemento["sceneItemId"],
             "sceneItemIndex": indice_mayor,
         }, parada)
-        self._elementos(escena, parada)
 
     def fuentes(self, escena, parada=None) -> tuple:
         if escena not in self.escenas(parada):
@@ -244,6 +281,16 @@ class GestorPanelObs:
             transformacion.get("positionX", 0), transformacion.get("positionY", 0),
             transformacion.get("width", 0), transformacion.get("height", 0),
             transformacion.get("alignment", 0))
+        # width/height ya llevan la escala aplicada. El panel se redimensiona
+        # escribiendo el tamaño de la entrada (redimensionar), así que el valor
+        # editable es sourceWidth/sourceHeight: con width, un panel escalado se
+        # encogía a la mitad con cada «Aplicar tamaño». Las demás fuentes se
+        # escalan (escalar) y ahí sí manda el tamaño en pantalla.
+        if fuente == NOMBRE_FUENTE:
+            ancho = transformacion.get("sourceWidth") or rect_panel[2]
+            alto = transformacion.get("sourceHeight") or rect_panel[3]
+        else:
+            ancho, alto = rect_panel[2], rect_panel[3]
         solapes = []
         delante = []
         for elemento in elementos:
@@ -268,8 +315,8 @@ class GestorPanelObs:
         bloqueada = panel.get("sceneItemLocked", False)
         return obs_disposicion.SnapshotPanel(
             conectado=conectado, escena=escena, al_aire=al_aire,
-            izquierda=rect_panel[0], arriba=rect_panel[1], ancho=int(rect_panel[2]),
-            alto=int(rect_panel[3]), lienzo_ancho=lienzo.get("baseWidth", 0),
+            izquierda=rect_panel[0], arriba=rect_panel[1], ancho=int(ancho),
+            alto=int(alto), lienzo_ancho=lienzo.get("baseWidth", 0),
             lienzo_alto=lienzo.get("baseHeight", 0), visible=visible,
             bloqueada=bloqueada, tapada_por=tapada_por, solapes=tuple(solapes),
             fuera=obs_disposicion.fuera_del_lienzo(

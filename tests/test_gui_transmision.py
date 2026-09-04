@@ -150,6 +150,17 @@ class TestTransmisionDialog(unittest.TestCase):
         self.assertFalse(self.dialogo.cho_escena.IsEnabled())
         self.assertFalse(self.dialogo.btn_tamano.IsEnabled())
 
+    def test_una_excepcion_no_prevista_libera_el_dialogo_y_avisa(self):
+        # Solo se capturaba ObsError: un TypeError (la fuente elegida ya no
+        # existe en OBS) mataba el hilo y dejaba todo desactivado para siempre.
+        def falla():
+            raise TypeError("'NoneType' object is not subscriptable")
+        with mock.patch.object(gui_transmision.logger, "warning"):
+            self.dialogo._en_hilo(falla)
+        self.assertFalse(self.dialogo._operacion_en_vuelo)
+        self.assertIn("OBS no pudo completar la operación",
+                      self.dialogo.txt_estado.GetValue())
+
     def test_casilla_del_panel_alterna_el_servidor(self):
         self.dialogo.Destroy()
         alternar = mock.Mock(side_effect=(True, False))
@@ -432,6 +443,91 @@ class TestTransmisionDialog(unittest.TestCase):
         self.dialogo._tecla_ajuste(EventoTecla(wx.WXK_ESCAPE))
         self.assertIn(("posicionar", "Principal", 32, 18, 5), self.gestor.llamadas)
         self.assertIn("Ajuste deshecho", self.anuncios)
+
+    def test_escape_con_movimiento_en_vuelo_espera_a_que_aterrice(self):
+        # Dos peticiones a la vez por el mismo socket se pisaban en OBS.
+        self.dialogo._iniciar_ajuste(Evento())
+        self.dialogo._movimiento_en_vuelo = True
+        self.dialogo._tecla_ajuste(EventoTecla(wx.WXK_ESCAPE))
+        self.assertFalse(self.dialogo._ajuste_en_curso)
+        self.assertNotIn(("posicionar", "Principal", 32, 18, 5), self.gestor.llamadas)
+
+        self.dialogo._movimiento_terminado(self.gestor.snap)
+        self.assertIn(("posicionar", "Principal", 32, 18, 5), self.gestor.llamadas)
+        self.assertEqual(self.anuncios[-1], "Ajuste deshecho")
+        self.assertFalse(self.dialogo._deshacer_pendiente)
+
+    def test_escape_con_movimiento_fallido_tambien_deshace(self):
+        self.dialogo._iniciar_ajuste(Evento())
+        self.dialogo._movimiento_en_vuelo = True
+        self.dialogo._tecla_ajuste(EventoTecla(wx.WXK_ESCAPE))
+        self.dialogo._movimiento_fallo("OBS no contesta")
+        self.assertIn(("posicionar", "Principal", 32, 18, 5), self.gestor.llamadas)
+        self.assertNotIn("OBS no contesta", self.anuncios)
+
+    def test_escape_sin_transformacion_guardada_no_revienta(self):
+        # transformacion() devuelve {} si la fuente desapareció de la escena:
+        # antes era un KeyError en el hilo principal.
+        self.gestor.transformacion_inicial = {}
+        self.dialogo._iniciar_ajuste(Evento())
+        self.dialogo._tecla_ajuste(EventoTecla(wx.WXK_ESCAPE))
+        self.assertFalse(self.dialogo._ajuste_en_curso)
+        self.assertNotIn("posicionar", [llamada[0] for llamada in self.gestor.llamadas])
+        self.assertEqual(self.anuncios[-1], "No se pudo deshacer el ajuste")
+
+    def test_destruir_marca_el_cierre_y_los_movimientos_tardios_no_tocan_controles(self):
+        self.dialogo._iniciar_ajuste(Evento())
+        self.dialogo._movimiento_en_vuelo = True
+        self.dialogo._al_destruir(Evento())
+        self.assertTrue(self.dialogo._cerrando)
+        with mock.patch.object(self.dialogo, "_mostrar_snap") as mostrar, \
+                mock.patch.object(self.dialogo, "_fallo") as fallo:
+            self.dialogo._movimiento_terminado(self.gestor.snap)
+            self.dialogo._movimiento_en_vuelo = True
+            self.dialogo._movimiento_fallo("tarde")
+        mostrar.assert_not_called()
+        fallo.assert_not_called()
+        self.assertFalse(self.dialogo._movimiento_en_vuelo)
+
+    def test_los_hilos_no_leen_controles_de_wx(self):
+        # Escena, fuente y tamaño se capturan en el hilo principal y viajan
+        # como argumentos; leer un wx.Choice desde otro hilo no es seguro.
+        original = gui_transmision.diagnostico.crear_hilo
+        dialogo = self.dialogo
+        fuera_del_hilo = AssertionError("control de wx leído desde un hilo")
+
+        def crear_hilo(funcion, nombre, **kwargs):
+            def envuelta():
+                pendientes = []
+                with mock.patch.object(dialogo, "_escena", side_effect=fuera_del_hilo), \
+                        mock.patch.object(dialogo, "_fuente", side_effect=fuera_del_hilo), \
+                        mock.patch.object(dialogo.sp_ancho, "GetValue", side_effect=fuera_del_hilo), \
+                        mock.patch.object(dialogo.sp_alto, "GetValue", side_effect=fuera_del_hilo), \
+                        mock.patch.object(gui_transmision.wx, "CallAfter",
+                                          lambda f, *a: pendientes.append((f, a))):
+                    funcion()
+                for funcion_pendiente, argumentos in pendientes:
+                    funcion_pendiente(*argumentos)
+            return original(envuelta, nombre, **kwargs)
+
+        with mock.patch.object(gui_transmision.diagnostico, "crear_hilo", crear_hilo), \
+                mock.patch.object(gui_transmision.logger, "warning") as aviso, \
+                mock.patch.object(gui_transmision.overlay_servidor, "esta_encendido",
+                                  return_value=True), \
+                mock.patch.object(gui_transmision.overlay_servidor, "puerto_actual",
+                                  return_value=8730):
+            for accion in (dialogo._actualizar, dialogo._poner_al_aire, dialogo._preparar,
+                           dialogo._cambiar_escena, dialogo._cambiar_fuente, dialogo._colocar,
+                           dialogo._tamano, dialogo._mostrar, dialogo._fijar, dialogo._frente,
+                           dialogo._restaurar, dialogo._iniciar_ajuste):
+                with self.subTest(accion=accion.__name__):
+                    accion(Evento())
+                    self.assertFalse(dialogo._operacion_en_vuelo)
+            dialogo._tecla_ajuste(EventoTecla(wx.WXK_RIGHT))
+            dialogo._tecla_ajuste(EventoTecla(wx.WXK_ESCAPE))
+            self.assertIn(("mover", "Principal", 10, 0), self.gestor.llamadas)
+        aviso.assert_not_called()
+        self.assertNotIn("OBS no pudo completar la operación. Inténtalo de nuevo.", self.anuncios)
 
     def test_tab_confirma_y_deja_navegar(self):
         self.dialogo._iniciar_ajuste(Evento())

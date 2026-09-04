@@ -16,6 +16,8 @@ from gui import ContadorAccesible, _T, anunciar, nombre_accesible
 from obs_panel import GestorPanelObs, NOMBRE_FUENTE
 import sound_player
 
+logger = diagnostico.obtener_logger(__name__)
+
 
 _TEXTO_LIENZO = (
     "El programa de emisión compone lo que ven los espectadores sobre un\n"
@@ -65,6 +67,7 @@ class TransmisionDialog(wx.Dialog):
         self._ajuste_en_curso = False
         self._ajuste_transformacion = None
         self._movimiento_en_vuelo = False
+        self._deshacer_pendiente = False
         self._cerrando = False
         self._operacion_en_vuelo = False
         self.SetBackgroundColour(_T.bg)
@@ -204,6 +207,12 @@ class TransmisionDialog(wx.Dialog):
                 resultado = funcion()
             except obs_cliente.ObsError as error:
                 wx.CallAfter(self._fallo, str(error))
+            except Exception as error:
+                # Cualquier otro fallo (la fuente ya no existe en OBS y
+                # obs_panel devuelve None, falta web/chat.html…) mataba el
+                # hilo sin avisar y dejaba el diálogo con todo desactivado.
+                logger.warning("operación OBS: %r", error)
+                wx.CallAfter(self._fallo, obs_cliente.mensaje_de_fallo_obs(error))
             else:
                 wx.CallAfter(self._terminar, resultado, al_terminar)
         diagnostico.crear_hilo(ejecutar, "TransmisionOBS").start()
@@ -249,6 +258,9 @@ class TransmisionDialog(wx.Dialog):
             anunciar("Consultando OBS", False)
 
     def _al_destruir(self, event):
+        # Un hilo puede aterrizar después del Destroy; sin esta marca tocaba
+        # controles ya muertos y wx levantaba RuntimeError.
+        self._cerrando = True
         self._temporizador_consulta.Stop()
         event.Skip()
 
@@ -307,8 +319,10 @@ class TransmisionDialog(wx.Dialog):
     def _fuente(self):
         return self.cho_fuente.GetStringSelection()
 
-    def _leer(self, escena=None):
-        return self._gestor.instantanea(escena or self._escena(), fuente=self._fuente())
+    def _leer(self, escena, fuente):
+        # Escena y fuente llegan como argumentos: los hilos de trabajo no deben
+        # leer controles de wx, eso solo es seguro desde el hilo principal.
+        return self._gestor.instantanea(escena, fuente=fuente)
 
     def _guardar_restauracion(self, escena, fuente):
         clave = escena, fuente
@@ -365,11 +379,12 @@ class TransmisionDialog(wx.Dialog):
         anunciar(self._frase_escena_al_aire(al_aire))
 
     def _actualizar(self, event):
-        self._en_hilo(self._leer_estados, self._estados_leidos)
+        escena, fuente = self._escena(), self._fuente()
+        self._en_hilo(lambda: self._leer_estados(escena, fuente), self._estados_leidos)
 
-    def _leer_estados(self):
-        return (self._leer(), self._gestor.escena_al_aire(), self._gestor.estado_transmision(),
-                self._gestor.estado_grabacion())
+    def _leer_estados(self, escena, fuente):
+        return (self._leer(escena, fuente), self._gestor.escena_al_aire(),
+                self._gestor.estado_transmision(), self._gestor.estado_grabacion())
 
     def _estados_leidos(self, datos):
         snap, al_aire, transmision, grabacion = datos
@@ -379,7 +394,8 @@ class TransmisionDialog(wx.Dialog):
         self._anunciar_estados(transmision, grabacion, al_aire)
 
     def _poner_al_aire(self, event):
-        self._en_hilo(lambda: self._gestor.poner_escena_al_aire(self._escena()),
+        escena = self._escena()
+        self._en_hilo(lambda: self._gestor.poner_escena_al_aire(escena),
                       self._escena_puesta_al_aire)
 
     def _escena_puesta_al_aire(self, escena):
@@ -417,9 +433,11 @@ class TransmisionDialog(wx.Dialog):
         anunciar(obs_estado.frase_resultado(accion))
 
     def _preparar(self, event):
-        self._en_hilo(self._preparar_panel, self._panel_preparado)
+        escena = self._escena()
+        ancho, alto = self.sp_ancho.GetValue(), self.sp_alto.GetValue()
+        self._en_hilo(lambda: self._preparar_panel(escena, ancho, alto), self._panel_preparado)
 
-    def _preparar_panel(self):
+    def _preparar_panel(self, escena, ancho, alto):
         puerto = overlay_servidor.puerto_actual() or _PUERTO_PANEL_DEFECTO
         if not overlay_servidor.esta_encendido():
             try:
@@ -427,11 +445,10 @@ class TransmisionDialog(wx.Dialog):
             except overlay_servidor.OverlayPuertoOcupadoError:
                 return f"No se pudo encender el panel, el puerto {puerto} está ocupado", (), None
         puerto = overlay_servidor.puerto_actual() or puerto
-        escena = self._escena()
         fuentes = self._gestor.fuentes(escena)
         if NOMBRE_FUENTE not in fuentes:
             url = f"http://127.0.0.1:{puerto}{_RUTA_PANEL_CHAT}"
-            self._gestor.asegurar_fuente(escena, url, self.sp_ancho.GetValue(), self.sp_alto.GetValue())
+            self._gestor.asegurar_fuente(escena, url, ancho, alto)
             fuentes = self._gestor.fuentes(escena)
         snap = self._gestor.instantanea(escena, fuente=NOMBRE_FUENTE)
         frase = obs_disposicion.describir_preparacion(
@@ -449,11 +466,11 @@ class TransmisionDialog(wx.Dialog):
     def _cambiar_escena(self, event):
         if self._operacion_en_vuelo:
             return
-        self._en_hilo(self._leer_escena, self._escena_cambiada)
+        escena = self._escena()
+        self._en_hilo(lambda: self._leer_escena(escena), self._escena_cambiada)
         event.Skip()
 
-    def _leer_escena(self):
-        escena = self._escena()
+    def _leer_escena(self, escena):
         fuentes = self._gestor.fuentes(escena)
         fuente = NOMBRE_FUENTE if NOMBRE_FUENTE in fuentes else (fuentes[0] if fuentes else "")
         return fuentes, fuente, self._gestor.instantanea(escena, fuente=fuente)
@@ -468,28 +485,31 @@ class TransmisionDialog(wx.Dialog):
     def _cambiar_fuente(self, event):
         if self._operacion_en_vuelo:
             return
-        self._en_hilo(self._leer, self._anunciar_snap)
+        escena, fuente = self._escena(), self._fuente()
+        self._en_hilo(lambda: self._leer(escena, fuente), self._anunciar_snap)
         event.Skip()
 
     def _colocar(self, event):
         anclaje = tuple(obs_disposicion.ANCLAJES)[self.cho_posicion.GetSelection()]
-        self._en_hilo(lambda: self._cambiar_y_leer(self._gestor.colocar, anclaje),
+        escena, fuente = self._escena(), self._fuente()
+        self._en_hilo(lambda: self._cambiar_y_leer(escena, fuente, self._gestor.colocar, anclaje),
                       self._anunciar_snap)
         event.Skip()
 
     def _tamano(self, event):
-        ancho, alto = self.sp_ancho.GetValue(), self.sp_alto.GetValue()
-        self._en_hilo(lambda: self._aplicar_tamano(ancho, alto), self._tamano_aplicado)
-
-    def _aplicar_tamano(self, ancho, alto):
         escena, fuente = self._escena(), self._fuente()
+        ancho, alto = self.sp_ancho.GetValue(), self.sp_alto.GetValue()
+        self._en_hilo(lambda: self._aplicar_tamano(escena, fuente, ancho, alto),
+                      self._tamano_aplicado)
+
+    def _aplicar_tamano(self, escena, fuente, ancho, alto):
         self._guardar_restauracion(escena, fuente)
         if fuente == NOMBRE_FUENTE:
             self._gestor.redimensionar(escena, ancho, alto)
-            return self._leer(), True
+            return self._leer(escena, fuente), True
         if not self._gestor.escalar(escena, ancho, alto, fuente=fuente):
-            return self._leer(), False
-        return self._leer(), True
+            return self._leer(escena, fuente), False
+        return self._leer(escena, fuente), True
 
     def _tamano_aplicado(self, datos):
         snap, aplicado = datos
@@ -501,29 +521,32 @@ class TransmisionDialog(wx.Dialog):
 
     def _mostrar(self, event):
         visible = self.chk_mostrar.GetValue()
-        self._en_hilo(lambda: self._cambiar_y_leer(self._gestor.mostrar, visible),
+        escena, fuente = self._escena(), self._fuente()
+        self._en_hilo(lambda: self._cambiar_y_leer(escena, fuente, self._gestor.mostrar, visible),
                       self._anunciar_snap)
         event.Skip()
 
     def _fijar(self, event):
         fijada = self.chk_fijar.GetValue()
-        self._en_hilo(lambda: self._cambiar_y_leer(self._gestor.fijar, fijada),
+        escena, fuente = self._escena(), self._fuente()
+        self._en_hilo(lambda: self._cambiar_y_leer(escena, fuente, self._gestor.fijar, fijada),
                       self._anunciar_snap)
         event.Skip()
 
     def _frente(self, event):
-        self._en_hilo(lambda: self._cambiar_y_leer(self._gestor.al_frente), self._anunciar_snap)
+        escena, fuente = self._escena(), self._fuente()
+        self._en_hilo(lambda: self._cambiar_y_leer(escena, fuente, self._gestor.al_frente),
+                      self._anunciar_snap)
 
     def _iniciar_ajuste(self, event):
         if self._ajuste_en_curso:
             return
-        escena = self._escena()
-        self._en_hilo(lambda: self._preparar_ajuste(escena), self._ajuste_iniciado)
+        escena, fuente = self._escena(), self._fuente()
+        self._en_hilo(lambda: self._preparar_ajuste(escena, fuente), self._ajuste_iniciado)
 
-    def _preparar_ajuste(self, escena):
-        fuente = self._fuente()
+    def _preparar_ajuste(self, escena, fuente):
         self._guardar_restauracion(escena, fuente)
-        return self._gestor.transformacion(escena, fuente=fuente), self._leer(escena)
+        return self._gestor.transformacion(escena, fuente=fuente), self._leer(escena, fuente)
 
     def _ajuste_iniciado(self, datos):
         self._ajuste_transformacion, snap = datos
@@ -559,15 +582,24 @@ class TransmisionDialog(wx.Dialog):
         def mover():
             try:
                 self._gestor.mover(escena, dx, dy, fuente=fuente)
-                snap = self._leer(escena)
+                snap = self._leer(escena, fuente)
             except obs_cliente.ObsError as error:
                 wx.CallAfter(self._movimiento_fallo, str(error))
+            except Exception as error:
+                logger.warning("ajuste fino OBS: %r", error)
+                wx.CallAfter(self._movimiento_fallo,
+                             obs_cliente.mensaje_de_fallo_obs(error))
             else:
                 wx.CallAfter(self._movimiento_terminado, snap)
         diagnostico.crear_hilo(mover, "AjusteFinoOBS").start()
 
     def _movimiento_terminado(self, snap):
         self._movimiento_en_vuelo = False
+        if self._cerrando:
+            return
+        if self._deshacer_pendiente:
+            self._deshacer_ajuste()
+            return
         if not self._ajuste_en_curso:
             return
         self._mostrar_snap(snap)
@@ -575,6 +607,11 @@ class TransmisionDialog(wx.Dialog):
 
     def _movimiento_fallo(self, mensaje):
         self._movimiento_en_vuelo = False
+        if self._cerrando:
+            return
+        if self._deshacer_pendiente:
+            self._deshacer_ajuste()
+            return
         if self._ajuste_en_curso:
             self._fallo(mensaje)
 
@@ -596,19 +633,32 @@ class TransmisionDialog(wx.Dialog):
         if confirmar:
             anunciar("Ajuste confirmado")
             return
+        if self._movimiento_en_vuelo:
+            # Deshacer mientras una flecha sigue en vuelo mandaba dos
+            # peticiones a la vez por el mismo socket; se espera a que aterrice.
+            self._deshacer_pendiente = True
+            return
+        self._deshacer_ajuste()
+
+    def _deshacer_ajuste(self):
+        self._deshacer_pendiente = False
         transformacion = self._ajuste_transformacion
-        escena = self._escena()
+        if not transformacion:
+            # transformacion() devuelve {} cuando la fuente ya no está en la
+            # escena; no hay a dónde volver.
+            anunciar("No se pudo deshacer el ajuste")
+            return
+        escena, fuente = self._escena(), self._fuente()
         self._en_hilo(
             lambda: self._gestor.posicionar(
                 escena, transformacion["positionX"],
-                transformacion["positionY"], transformacion["alignment"], fuente=self._fuente()),
+                transformacion["positionY"], transformacion["alignment"], fuente=fuente),
             lambda resultado: anunciar("Ajuste deshecho"))
 
-    def _cambiar_y_leer(self, funcion, *argumentos):
-        escena, fuente = self._escena(), self._fuente()
+    def _cambiar_y_leer(self, escena, fuente, funcion, *argumentos):
         self._guardar_restauracion(escena, fuente)
         funcion(escena, *argumentos, fuente=fuente)
-        return self._leer()
+        return self._leer(escena, fuente)
 
     def _captura(self, event):
         with wx.FileDialog(self, "Guardar una captura de la escena", wildcard="Imagen PNG (*.png)|*.png",
@@ -616,11 +666,13 @@ class TransmisionDialog(wx.Dialog):
             if dialogo.ShowModal() != wx.ID_OK:
                 return
             ruta = dialogo.GetPath()
-        self._en_hilo(lambda: self._guardar_captura(ruta), lambda resultado: anunciar("Captura guardada"))
+        escena, fuente = self._escena(), self._fuente()
+        self._en_hilo(lambda: self._guardar_captura(escena, fuente, ruta),
+                      lambda resultado: anunciar("Captura guardada"))
 
-    def _guardar_captura(self, ruta):
-        self._gestor.captura_de_escena(self._escena(), ruta)
-        return self._leer()
+    def _guardar_captura(self, escena, fuente, ruta):
+        self._gestor.captura_de_escena(escena, ruta)
+        return self._leer(escena, fuente)
 
     def _lienzo(self, event):
         wx.MessageBox(_TEXTO_LIENZO, "Qué es el lienzo", wx.OK | wx.ICON_INFORMATION, self)
@@ -630,9 +682,11 @@ class TransmisionDialog(wx.Dialog):
                       wx.OK | wx.ICON_INFORMATION, self)
 
     def _restaurar(self, event):
-        self._en_hilo(self._aplicar_restauracion, lambda snap: anunciar("Restablecido"))
+        escena, fuente = self._escena(), self._fuente()
+        self._en_hilo(lambda: self._aplicar_restauracion(escena, fuente),
+                      lambda snap: anunciar("Restablecido"))
 
-    def _aplicar_restauracion(self):
+    def _aplicar_restauracion(self, escena_actual, fuente_actual):
         for (escena, fuente), datos in self._restablecer.items():
             transformacion = datos["transformacion"]
             if transformacion:
@@ -645,7 +699,7 @@ class TransmisionDialog(wx.Dialog):
                 self._gestor.escalar(escena, datos["ancho"], datos["alto"], fuente=fuente)
             self._gestor.mostrar(escena, datos["visible"], fuente=fuente)
             self._gestor.fijar(escena, datos["bloqueada"], fuente=fuente)
-        return self._leer()
+        return self._leer(escena_actual, fuente_actual)
 
     def _cerrar(self, event):
         if self._cerrando:

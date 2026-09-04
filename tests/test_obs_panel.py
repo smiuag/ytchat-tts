@@ -20,9 +20,10 @@ def elemento(identificador, nombre, indice, x=32, y=882, ancho=460, alto=620,
 
 class DobleObs:
     def __init__(self, elementos=None, entradas=(), escena="Escena", escenas=None,
-                 silencios=None):
+                 silencios=None, grupos=None):
         self.elementos = list(elementos or ())
         self.entradas = list(entradas)
+        self.grupos = dict(grupos or {})
         self.escena = escena
         self.escenas = tuple(escenas if escenas is not None else (escena,))
         self.llamadas = []
@@ -44,6 +45,8 @@ class DobleObs:
         self.llamadas.append((tipo, datos, parada))
         if tipo == "GetSceneItemList":
             return {"responseData": {"sceneItems": list(self.elementos)}}
+        if tipo == "GetGroupSceneItemList":
+            return {"responseData": {"sceneItems": list(self.grupos.get(datos["sceneName"], ()))}}
         if tipo == "GetSceneList":
             return {"responseData": {"scenes": [
                 {"sceneName": escena} for escena in self.escenas]}}
@@ -62,7 +65,7 @@ class DobleObs:
             return {"responseData": {"inputMuted": self.silencios[nombre]}}
         if tipo == "GetStreamStatus":
             return {"responseData": {"outputActive": self.transmitiendo,
-                                      "outputDuration": 61,
+                                      "outputDuration": 61000,
                                       "outputSkippedFrames": 2,
                                       "outputTotalFrames": 100}}
         if tipo == "GetRecordStatus":
@@ -150,6 +153,73 @@ class GestorPanelObsTest(unittest.TestCase):
         self.assertEqual(self.gestor(doble).asegurar_fuente("Escena", "u", 1, 2), 21)
         llamada = next(llamada for llamada in doble.llamadas if llamada[0] == "CreateInput")
         self.assertEqual(llamada[1]["inputKind"], "browser_source")
+
+    def test_asegura_no_duplica_el_panel_metido_en_un_grupo(self):
+        grupo = dict(elemento(7, "Grupo", 0), isGroup=True)
+        doble = DobleObs([grupo],
+                         entradas=[{"inputName": obs_panel.NOMBRE_FUENTE,
+                                    "inputKind": "browser_source"}],
+                         grupos={"Grupo": [elemento(3, obs_panel.NOMBRE_FUENTE, 0)]})
+        identificador = self.gestor(doble).asegurar_fuente("Escena", "http://x", 460, 620)
+        self.assertEqual(identificador, 3)
+        tipos = [llamada[0] for llamada in doble.llamadas]
+        self.assertNotIn("CreateSceneItem", tipos)
+        self.assertNotIn("CreateInput", tipos)
+        self.assertIn("SetInputSettings", tipos)
+
+    def test_asegura_rechaza_una_fuente_ajena_con_el_mismo_nombre(self):
+        doble = DobleObs(entradas=[{"inputName": obs_panel.NOMBRE_FUENTE,
+                                    "inputKind": "text_gdiplus_v2"}])
+        with self.assertRaisesRegex(obs_panel.obs_cliente.ObsError, "no es un navegador"):
+            self.gestor(doble).asegurar_fuente("Escena", "u", 1, 2)
+        tipos = [llamada[0] for llamada in doble.llamadas]
+        self.assertNotIn("CreateSceneItem", tipos)
+        self.assertNotIn("SetInputSettings", tipos)
+
+    def test_fuente_desaparecida_da_un_error_de_obs_y_no_un_typeerror(self):
+        operaciones = (
+            ("posicionar", ("Escena", 10, 20, 5)),
+            ("mover", ("Escena", 10, 20)),
+            ("escalar", ("Escena", 640, 360)),
+            ("mostrar", ("Escena", False)),
+            ("fijar", ("Escena", True)),
+        )
+        for metodo, argumentos in operaciones:
+            with self.subTest(metodo=metodo):
+                gestor = self.gestor(DobleObs([elemento(2, "Cámara", 0)]))
+                with self.assertRaisesRegex(obs_panel.obs_cliente.ObsError,
+                                            "no encuentra la escena o la fuente"):
+                    getattr(gestor, metodo)(*argumentos)
+
+    def test_fijar_y_al_frente_no_releen_la_escena_despues_de_escribir(self):
+        doble = DobleObs([elemento(1, obs_panel.NOMBRE_FUENTE, 0), elemento(2, "Juego", 4)])
+        gestor = self.gestor(doble)
+        gestor.fijar("Escena", True)
+        gestor.al_frente("Escena")
+        tipos = [llamada[0] for llamada in doble.llamadas]
+        self.assertEqual(tipos, ["GetSceneItemList", "SetSceneItemLocked",
+                                 "GetSceneItemList", "SetSceneItemIndex"])
+
+    def test_instantanea_del_panel_escalado_informa_el_tamano_de_la_entrada(self):
+        # width/height llevan la escala; el panel se redimensiona por la
+        # entrada, así que ese es el valor que debe volver a los contadores.
+        doble = DobleObs([elemento(1, obs_panel.NOMBRE_FUENTE, 0, ancho=230, alto=310,
+                                   ancho_fuente=460, alto_fuente=620)])
+        snap = self.gestor(doble).instantanea("Escena")
+        self.assertEqual((snap.ancho, snap.alto), (460, 620))
+
+    def test_instantanea_sin_tamano_de_entrada_usa_el_de_pantalla(self):
+        panel = elemento(1, obs_panel.NOMBRE_FUENTE, 0, ancho=230, alto=310)
+        del panel["sceneItemTransform"]["sourceWidth"]
+        del panel["sceneItemTransform"]["sourceHeight"]
+        snap = self.gestor(DobleObs([panel])).instantanea("Escena")
+        self.assertEqual((snap.ancho, snap.alto), (230, 310))
+
+    def test_instantanea_de_otra_fuente_escalada_informa_el_tamano_en_pantalla(self):
+        doble = DobleObs([elemento(2, "Cámara", 0, ancho=640, alto=360,
+                                   ancho_fuente=1280, alto_fuente=720)])
+        snap = self.gestor(doble).instantanea("Escena", fuente="Cámara")
+        self.assertEqual((snap.ancho, snap.alto), (640, 360))
 
     def test_al_frente_no_manda_si_ya_esta_arriba(self):
         doble = DobleObs([elemento(1, obs_panel.NOMBRE_FUENTE, 2), elemento(2, "Juego", 1)])

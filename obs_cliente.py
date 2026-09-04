@@ -4,10 +4,12 @@ import base64
 import hashlib
 import json
 import os
+import threading
 import time
 import uuid
 from dataclasses import dataclass
 
+from websockets.exceptions import ConnectionClosed
 from websockets.sync.client import connect
 
 
@@ -55,6 +57,9 @@ class ObsError(RuntimeError):
     """Fallo entendible producido al comunicarse con OBS."""
 
 
+MENSAJE_CONEXION_PERDIDA = "Se perdió la conexión con OBS. Vuelve a conectar."
+
+
 def mensaje_de_fallo_obs(motivo):
     """Traduce un motivo técnico a un mensaje breve para el usuario."""
     if isinstance(motivo, ObsError):
@@ -84,12 +89,17 @@ class ClienteObs:
         self.ajustes = ajustes or AjustesObs()
         self._conectar_fn = conectar_fn or connect
         self._transporte = None
+        # websockets.sync no admite dos recv a la vez: el ajuste fino y el
+        # resto del diálogo piden desde hilos distintos.
+        self._cerrojo = threading.Lock()
 
     @property
     def conectado(self):
         return self._transporte is not None
 
     def conectar(self, parada=None):
+        # Reconectar sin cerrar dejaba el socket anterior abierto para siempre.
+        self.cerrar()
         limite = time.monotonic() + self._TIEMPO_LIMITE
         transporte = None
         try:
@@ -99,7 +109,10 @@ class ClienteObs:
             saludo = self._recibir(transporte, parada, limite)
             if saludo.get("op") != 0:
                 raise ObsError(mensaje_de_fallo_obs("saludo inválido"))
-            identificacion = {"op": 1, "d": {"rpcVersion": saludo["d"]["rpcVersion"]}}
+            # Solo se piden respuestas; sin esto OBS empuja eventos que se
+            # acumulan en la cola del socket entre sondeos.
+            identificacion = {"op": 1, "d": {"rpcVersion": saludo["d"]["rpcVersion"],
+                                             "eventSubscriptions": 0}}
             autenticacion = saludo.get("d", {}).get("authentication")
             if autenticacion:
                 identificacion["d"]["authentication"] = respuesta_auth(
@@ -122,36 +135,43 @@ class ClienteObs:
             raise ObsError(mensaje_de_fallo_obs(error)) from error
 
     def pedir(self, tipo, datos=None, parada=None):
-        if self._transporte is None:
-            raise ObsError(mensaje_de_fallo_obs("not connected"))
-        identificador = str(uuid.uuid4())
-        peticion = {
-            "op": 6,
-            "d": {
-                "requestType": tipo,
-                "requestId": identificador,
-                "requestData": datos or {},
-            },
-        }
-        limite = time.monotonic() + self._TIEMPO_LIMITE
-        try:
-            self._transporte.send(json.dumps(peticion))
-            while True:
-                mensaje = self._recibir(self._transporte, parada, limite)
-                if mensaje.get("op") != 7:
-                    continue
-                datos_respuesta = mensaje.get("d", {})
-                if datos_respuesta.get("requestId") != identificador:
-                    continue
-                estado = datos_respuesta.get("requestStatus", {})
-                if not estado.get("result", False):
-                    motivo = f"{estado.get('code', '')} {estado.get('comment', '')}"
-                    raise ObsError(mensaje_de_fallo_obs(motivo))
-                return datos_respuesta
-        except ObsError:
-            raise
-        except Exception as error:
-            raise ObsError(mensaje_de_fallo_obs(error)) from error
+        with self._cerrojo:
+            transporte = self._transporte
+            if transporte is None:
+                raise ObsError(mensaje_de_fallo_obs("not connected"))
+            identificador = str(uuid.uuid4())
+            peticion = {
+                "op": 6,
+                "d": {
+                    "requestType": tipo,
+                    "requestId": identificador,
+                    "requestData": datos or {},
+                },
+            }
+            limite = time.monotonic() + self._TIEMPO_LIMITE
+            try:
+                transporte.send(json.dumps(peticion))
+                while True:
+                    mensaje = self._recibir(transporte, parada, limite)
+                    if mensaje.get("op") != 7:
+                        continue
+                    datos_respuesta = mensaje.get("d", {})
+                    if datos_respuesta.get("requestId") != identificador:
+                        continue
+                    estado = datos_respuesta.get("requestStatus", {})
+                    if not estado.get("result", False):
+                        motivo = f"{estado.get('code', '')} {estado.get('comment', '')}"
+                        raise ObsError(mensaje_de_fallo_obs(motivo))
+                    return datos_respuesta
+            except ObsError:
+                raise
+            except ConnectionClosed as error:
+                # OBS colgó: si el transporte se quedara, conectado seguiría en
+                # True y cada petición fallaría con «Inténtalo de nuevo».
+                self.cerrar()
+                raise ObsError(MENSAJE_CONEXION_PERDIDA) from error
+            except Exception as error:
+                raise ObsError(mensaje_de_fallo_obs(error)) from error
 
     def cerrar(self):
         if self._transporte is not None:
